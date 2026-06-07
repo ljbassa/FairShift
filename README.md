@@ -1,4 +1,4 @@
-# Paper Submission Code
+# FairShift
 
 This repository contains the code folders used for the paper submission. FairShift is the method proposed in the paper, and these folders contain experiments that apply FairShift to EDGE and FairWire variants.
 
