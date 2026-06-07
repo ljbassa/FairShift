@@ -1,0 +1,30 @@
+data/
+wandb/
+
+# generated artifacts
+saved_generated/
+*.pt
+*.pth
+*.ckpt
+__pycache__/
+*.pyc
+*.pkl
+*.png
+*.pdf
+*.svg
+*.eps
+*.tif
+*.tiff
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+*.csv
+*.log
+
+# experiment outputs
+fairwire_aA_pareto_*/
+generated_graphs/
+generated_samples/
+logs/

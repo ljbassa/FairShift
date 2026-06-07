@@ -1,0 +1,54 @@
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# OS/editor noise
+.DS_Store
+*~
+\#*\#
+tmp.txt
+*.tmp
+
+# Model checkpoints and generated graph/data artifacts
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.npz
+*.npy
+
+# Experiment outputs and plots
+*.png
+*.pdf
+*.svg
+*.eps
+*.tif
+*.tiff
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+*.csv
+*.log
+eval_*seed*.txt
+
+# Common generated-output directories
+data/
+wandb/
+saved_generated/
+generated_graphs/
+generated_pkls/
+generated_pkls_*/
+generated_samples/
+logs/
+raw_logs/
+batch_runs/
+stale_cpts_*/
+*_cpts/
+fairwire_aA_pareto_*/
+fair_grid_*/

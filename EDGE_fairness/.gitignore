@@ -1,0 +1,24 @@
+data/
+wandb/
+
+# generated artifacts
+saved_generated/
+*.pt
+*.pth
+*.ckpt
+__pycache__/
+*.pyc
+*.pkl
+.DS_Store
+*.png
+*.pdf
+*.svg
+*.eps
+*.tif
+*.tiff
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.webp
+*.csv
