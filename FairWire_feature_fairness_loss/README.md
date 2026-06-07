@@ -72,9 +72,11 @@ with normalized guidance, generates graphs from `controller_best`, and runs LP
 evaluation automatically.
 
 ```bash
+export FW_FEATURE_CONTROLLER_RUN=replace_with_fw_feature_controller_run_name
+
 python train_controller.py \
   --controller_pretrained_ckpt "$FEATURE_STAGE1_AA0_CKPT" \
-  --name cora_T3_feature_aA0_controller_norm \
+  --name "$FW_FEATURE_CONTROLLER_RUN" \
   --log_home ./wandb \
   --device cuda:0 \
   --seed 0 \
@@ -103,7 +105,7 @@ python train_controller.py \
 Typical outputs are written under:
 
 ```text
-wandb/cora/Sync/controller/cora_T3_feature_aA0_controller_norm/
+wandb/cora/Sync/controller/<FW_FEATURE_CONTROLLER_RUN_NAME>/
 ```
 
 Important files include:
@@ -128,10 +130,12 @@ Use `scripts/run_controller_grid.py` to sweep controller hyperparameters. With
 graphs, writes a summary CSV, and plots the LP AUC versus score-SP Pareto curve.
 
 ```bash
+export FW_FEATURE_CONTROLLER_GRID_PREFIX=replace_with_fw_feature_controller_grid_prefix
+
 python scripts/run_controller_grid.py \
   --repo_dir . \
   --stage1_ckpt "$FEATURE_STAGE1_AA0_CKPT" \
-  --name_prefix cora_T3_feature_aA0_controller_norm_grid \
+  --name_prefix "$FW_FEATURE_CONTROLLER_GRID_PREFIX" \
   --controller_root ./wandb/cora/Sync/controller \
   --device cuda:0 \
   --log_home ./wandb \
@@ -161,7 +165,7 @@ python scripts/run_controller_grid.py \
 
 The grid writes outputs under `wandb/cora/Sync/controller/`, including:
 
-- `cora_T3_feature_aA0_controller_norm_grid_manifest.jsonl`
-- `cora_T3_feature_aA0_controller_norm_grid_summary.csv`
-- `cora_T3_feature_aA0_controller_norm_grid_pareto_lp_auc_vs_score_sp.jpg`
-- `cora_T3_feature_aA0_controller_norm_grid_pareto_lp_auc_vs_score_sp.front.csv`
+- `<FW_FEATURE_CONTROLLER_GRID_PREFIX>_manifest.jsonl`
+- `<FW_FEATURE_CONTROLLER_GRID_PREFIX>_summary.csv`
+- `<FW_FEATURE_CONTROLLER_GRID_PREFIX>_pareto_lp_auc_vs_score_sp.jpg`
+- `<FW_FEATURE_CONTROLLER_GRID_PREFIX>_pareto_lp_auc_vs_score_sp.front.csv`

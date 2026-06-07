@@ -104,10 +104,11 @@ evaluation so that LP AUC and score-SP are written automatically.
 
 ```bash
 export STAGE1_AA0_CKPT=cora_0.0_0.0_cpts/Sync_T8.pth
+export FW_CONTROLLER_RUN=replace_with_fw_controller_run_name
 
 python train_controller.py \
   --controller_pretrained_ckpt "$STAGE1_AA0_CKPT" \
-  --name cora_T8_aA0_controller_norm \
+  --name "$FW_CONTROLLER_RUN" \
   --log_home ./wandb \
   --device cuda:0 \
   --seed 0 \
@@ -140,6 +141,9 @@ The most important columns are:
 - `aggregate_lp/auc`
 - `aggregate_lp/score_sp_abs_gap`
 
+The generated CSV files for one controller run are written under
+`wandb/<dataset>/Sync/controller/<FW_CONTROLLER_RUN_NAME>/generated_samples/`.
+
 ## 5. Controller Grid Search
 
 Use `scripts/run_controller_grid.py` to sweep controller hyperparameters. With
@@ -148,11 +152,13 @@ graphs, builds a summary CSV, and plots the Pareto curve for LP AUC versus
 score-SP.
 
 ```bash
+export FW_CONTROLLER_GRID_PREFIX=replace_with_fw_controller_grid_prefix
+
 python scripts/run_controller_grid.py \
   --repo_dir . \
   --stage1_ckpt "$STAGE1_AA0_CKPT" \
   --dataset cora \
-  --name_prefix cora_T8_aA0_controller_norm_grid \
+  --name_prefix "$FW_CONTROLLER_GRID_PREFIX" \
   --device cuda:0 \
   --log_home ./wandb \
   --eta_values 0.005 0.01 0.02 \
@@ -181,7 +187,7 @@ python scripts/run_controller_grid.py \
 By default, the grid script writes outputs under
 `wandb/<dataset>/Sync/controller/`, including:
 
-- `<name_prefix>_manifest.jsonl`
-- `<name_prefix>_summary.csv`
-- `<name_prefix>_pareto_lp_auc_vs_score_sp.jpg`
-- `<name_prefix>_pareto_lp_auc_vs_score_sp.front.csv`
+- `<FW_CONTROLLER_GRID_PREFIX>_manifest.jsonl`
+- `<FW_CONTROLLER_GRID_PREFIX>_summary.csv`
+- `<FW_CONTROLLER_GRID_PREFIX>_pareto_lp_auc_vs_score_sp.jpg`
+- `<FW_CONTROLLER_GRID_PREFIX>_pareto_lp_auc_vs_score_sp.front.csv`

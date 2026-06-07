@@ -63,14 +63,17 @@ supports `pubmed`, `cornell`, `texas`, `wisconsin`, `amazon_computer`, and `amaz
 
 Change `--device` as needed for your machine. Each command writes checkpoints to
 `wandb/<dataset>/multinomial_diffusion/multistep/<name>/check/`.
+Replace placeholder run names such as `<EDGE_STAGE1_RUN_NAME>` before running the commands.
 
 `--checkpoint 10000` in evaluation loads `check/checkpoint_9999.pt`, because checkpoint filenames are zero-indexed.
 
 ### Cora
 
 ```bash
+export EDGE_STAGE1_RUN=replace_with_edge_stage1_run_name
+
 python train.py \
-  --name cora_edge \
+  --name "$EDGE_STAGE1_RUN" \
   --epochs 10000 \
   --num_generation 8 \
   --num_iter 32 \
@@ -99,8 +102,10 @@ python train.py \
 ### Citeseer
 
 ```bash
+export EDGE_STAGE1_RUN=replace_with_edge_stage1_run_name
+
 python train.py \
-  --name citeseer_edge \
+  --name "$EDGE_STAGE1_RUN" \
   --epochs 10000 \
   --num_generation 8 \
   --num_iter 32 \
@@ -129,8 +134,10 @@ python train.py \
 ### Amazon Photo
 
 ```bash
+export EDGE_STAGE1_RUN=replace_with_edge_stage1_run_name
+
 python train.py \
-  --name amazon_photo_edge \
+  --name "$EDGE_STAGE1_RUN" \
   --epochs 10000 \
   --num_generation 4 \
   --eval_num_generation 2 \
@@ -170,7 +177,7 @@ minimize.
 python fair_grid_eval_generated_graphs.py \
   --repo_dir . \
   --dataset cora \
-  --run_name cora_edge \
+  --run_name "$EDGE_STAGE1_RUN" \
   --checkpoint 10000 \
   --num_samples 8 \
   --eta_values 0.005 0.01 0.015 0.02 \
@@ -196,6 +203,10 @@ fair_grid_generated_lp_norm_cora/summary_long.csv
 fair_grid_generated_lp_norm_cora/summary_long_cora.csv
 fair_grid_generated_lp_norm_cora/pareto_curve_cora.jpg
 ```
+
+The CSV files used for the LP AUC vs score-SP table are produced by the command above. The per-run CSV files are under
+`fair_grid_generated_lp_norm_cora/evaluated_graphs/`, and the aggregate CSVs are the top-level `summary_long*.csv`
+files.
 
 To keep a short generic filename as well:
 

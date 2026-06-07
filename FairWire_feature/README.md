@@ -71,6 +71,46 @@ The batch runner writes logs and summaries under `batch_runs/train/`, including:
 Each successful run still writes the normal FairWire checkpoint directory, such
 as `cora_1.0_0.0_cpts/Sync_T3.pth`.
 
+## Generating LP AUC / Score-SP CSVs
+
+After the checkpoints exist, run `fair_grid_eval.py` to sample from each
+checkpoint, evaluate the generated graphs, and aggregate the per-seed results.
+The command below is the Cora `aA` sweep used to produce the CSV summaries for
+the FW-fc baseline.
+
+```bash
+python fair_grid_eval.py \
+  --repo_dir . \
+  --python_exec "$(command -v python)" \
+  --model_globs "cora_*_0.0_cpts/Sync_T3.pth" \
+  --dataset cora \
+  --num_samples 64 \
+  --sample_gpu 0 \
+  --seeds 0 1 2 \
+  --out_dir fairwire_feature_aA_pareto_cora_T3 \
+  --plot_x_metric lp/score_sp_abs_gap_mean \
+  --plot_y_metric lp/auc_mean \
+  --label_points front \
+  -- \
+  --device cuda:0 \
+  --label_attr y \
+  --sensitive_attr y \
+  --lp_epochs 1000
+```
+
+The main CSV outputs are:
+
+- `fairwire_feature_aA_pareto_cora_T3/summary_long.csv`
+- `fairwire_feature_aA_pareto_cora_T3/summary_agg.csv`
+- `fairwire_feature_aA_pareto_cora_T3/pareto_front.csv`
+- Per-run evaluation files under
+  `fairwire_feature_aA_pareto_cora_T3/eval_outputs/`, including
+  `*.summary.csv` and `*.per_graph.csv`.
+
+Use the same command for Citeseer or Amazon Photo by changing `--dataset`,
+`--model_globs`, and `--out_dir` to the matching dataset and checkpoint
+pattern.
+
 ## Supported Datasets
 
 The training CLI accepts:

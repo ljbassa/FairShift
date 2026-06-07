@@ -11,7 +11,7 @@ Use this repository after you already have a compatible Stage-1 checkpoint.
 Required inputs:
 
 - A Stage-1 checkpoint trained in `../EDGE_fairness`, for example
-  `../EDGE_fairness/wandb/cora/multinomial_diffusion/multistep/stage1_cora_base/check/checkpoint_9999.pt`.
+  `../EDGE_fairness/wandb/cora/multinomial_diffusion/multistep/<EDGE_STAGE1_RUN_NAME>/check/checkpoint_9999.pt`.
 - A matching graph pickle in this repository, for example `graphs/cora_feat.pkl`.
 - The same model-shape arguments used by Stage-1: `--dataset`, `--diffusion_dim`, `--diffusion_steps`,
   `--edge_dropout`, `--use_node_feat`, `--degree`, `--noise_schedule`, `--loss_type`, `--parametrization`, and
@@ -36,7 +36,7 @@ The grid script can perform steps 5 and 6 automatically when `--run_generated_ev
 ## Installation
 
 ```bash
-cd /home/jongboklee/EDGE_fairness_loss
+cd EDGE_fairness_loss
 pip install -r requirements.txt
 ```
 
@@ -54,7 +54,7 @@ The training and evaluation code expects NetworkX pickles under `graphs/`. Each 
 Create them in this repository:
 
 ```bash
-cd /home/jongboklee/EDGE_fairness_loss
+cd EDGE_fairness_loss
 mkdir -p graphs data
 
 python datasets/make_planetoid_pickle.py \
@@ -86,10 +86,11 @@ cp ../EDGE_fairness/graphs/amazon_photo_feat.pkl graphs/amazon_photo_feat.pkl
 Train the base model in `EDGE_fairness`. The Cora example below matches the controller examples in this README.
 
 ```bash
-cd /home/jongboklee/EDGE_fairness
+cd EDGE_fairness
+export EDGE_STAGE1_RUN=replace_with_edge_stage1_run_name
 
 python train.py \
-  --name stage1_cora_base \
+  --name "$EDGE_STAGE1_RUN" \
   --epochs 10000 \
   --num_generation 8 \
   --num_iter 32 \
@@ -120,7 +121,7 @@ python train.py \
 The checkpoint used by Stage-2 is:
 
 ```text
-../EDGE_fairness/wandb/cora/multinomial_diffusion/multistep/stage1_cora_base/check/checkpoint_9999.pt
+../EDGE_fairness/wandb/cora/multinomial_diffusion/multistep/<EDGE_STAGE1_RUN_NAME>/check/checkpoint_9999.pt
 ```
 
 Checkpoint filenames are zero-indexed: `--checkpoint 10000` corresponds to `checkpoint_9999.pt`.
@@ -128,8 +129,9 @@ Checkpoint filenames are zero-indexed: `--checkpoint 10000` corresponds to `chec
 Set a shell variable before running Stage-2:
 
 ```bash
-cd /home/jongboklee/EDGE_fairness_loss
-export STAGE1_CKPT=../EDGE_fairness/wandb/cora/multinomial_diffusion/multistep/stage1_cora_base/check/checkpoint_9999.pt
+cd EDGE_fairness_loss
+export EDGE_STAGE1_RUN=replace_with_edge_stage1_run_name
+export STAGE1_CKPT=../EDGE_fairness/wandb/cora/multinomial_diffusion/multistep/${EDGE_STAGE1_RUN}/check/checkpoint_9999.pt
 ```
 
 For Citeseer, use `--dataset citeseer`, `--diffusion_steps 128`, `--batch_size 4`, `--edge_dropout 0.0`, and the
@@ -142,10 +144,11 @@ Run `train_controller.py` from this repository. This freezes the Stage-1 denoise
 fairness-controller parameters.
 
 ```bash
-cd /home/jongboklee/EDGE_fairness_loss
+cd EDGE_fairness_loss
+export EDGE_CONTROLLER_RUN=replace_with_edge_controller_run_name
 
 python train_controller.py \
-  --name stage2_cora_controller_norm \
+  --name "$EDGE_CONTROLLER_RUN" \
   --controller_pretrained_ckpt "$STAGE1_CKPT" \
   --controller_epochs 500 \
   --controller_lr 1e-3 \
@@ -185,7 +188,7 @@ python train_controller.py \
 Outputs are written to:
 
 ```text
-wandb/cora/multinomial_diffusion/controller/stage2_cora_controller_norm/
+wandb/cora/multinomial_diffusion/controller/<EDGE_CONTROLLER_RUN_NAME>/
 ```
 
 Important output files:
@@ -207,7 +210,7 @@ GAE LP evaluator:
 
 ```bash
 python evaluate_generated_graphs.py \
-  --graph_path wandb/cora/multinomial_diffusion/controller/stage2_cora_controller_norm/generated_samples/controller_best.pyg_full.pt \
+  --graph_path wandb/cora/multinomial_diffusion/controller/${EDGE_CONTROLLER_RUN}/generated_samples/controller_best.pyg_full.pt \
   --dataset cora \
   --label_attr y \
   --sensitive_attr y \
@@ -236,10 +239,12 @@ Use `scripts/run_controller_grid.py` to sweep controller hyperparameters. With `
 each controller, evaluates `controller_best.pyg_full.pt`, writes a grid summary CSV, and draws a Pareto curve.
 
 ```bash
+export EDGE_CONTROLLER_GRID_PREFIX=replace_with_edge_controller_grid_prefix
+
 python scripts/run_controller_grid.py \
   --repo_dir . \
   --stage1_ckpt "$STAGE1_CKPT" \
-  --name_prefix grid_cora_norm \
+  --name_prefix "$EDGE_CONTROLLER_GRID_PREFIX" \
   --dataset cora \
   --device cuda:0 \
   --generated_eval_device cuda:0 \
@@ -270,16 +275,16 @@ python scripts/run_controller_grid.py \
 Expected grid outputs:
 
 ```text
-wandb/cora/multinomial_diffusion/controller/grid_cora_norm_manifest.jsonl
-wandb/cora/multinomial_diffusion/controller/grid_cora_norm_summary.csv
-wandb/cora/multinomial_diffusion/controller/grid_cora_norm_pareto_lp_auc_vs_score_sp.jpg
-wandb/cora/multinomial_diffusion/controller/grid_cora_norm_pareto_lp_auc_vs_score_sp.front.csv
+wandb/cora/multinomial_diffusion/controller/<EDGE_CONTROLLER_GRID_PREFIX>_manifest.jsonl
+wandb/cora/multinomial_diffusion/controller/<EDGE_CONTROLLER_GRID_PREFIX>_summary.csv
+wandb/cora/multinomial_diffusion/controller/<EDGE_CONTROLLER_GRID_PREFIX>_pareto_lp_auc_vs_score_sp.jpg
+wandb/cora/multinomial_diffusion/controller/<EDGE_CONTROLLER_GRID_PREFIX>_pareto_lp_auc_vs_score_sp.front.csv
 ```
 
 Each individual grid run is stored under:
 
 ```text
-wandb/cora/multinomial_diffusion/controller/grid_cora_norm_*/
+wandb/cora/multinomial_diffusion/controller/<EDGE_CONTROLLER_GRID_PREFIX>_*/
 ```
 
 The per-run directory name includes an automatic `norm` or `raw` tag after the prefix.
@@ -297,8 +302,10 @@ Useful grid flags:
 If you ran the grid without `--run_generated_eval`, first evaluate the generated graphs for each run. For one run:
 
 ```bash
+export EDGE_CONTROLLER_GRID_RUN_DIR=replace_with_edge_controller_grid_run_dir
+
 python evaluate_generated_graphs.py \
-  --graph_path wandb/cora/multinomial_diffusion/controller/grid_cora_norm_norm_kinit0p5_eta1em06_lr0p001_fw1_uw0p1_kw1/generated_samples/controller_best.pyg_full.pt \
+  --graph_path "${EDGE_CONTROLLER_GRID_RUN_DIR}/generated_samples/controller_best.pyg_full.pt" \
   --dataset cora \
   --label_attr y \
   --sensitive_attr y \
@@ -310,17 +317,17 @@ Then summarize all controller runs with the same prefix:
 ```bash
 python scripts/summarize_controller_grid.py \
   --controller_root wandb/cora/multinomial_diffusion/controller \
-  --prefix grid_cora_norm \
+  --prefix "$EDGE_CONTROLLER_GRID_PREFIX" \
   --sort_by lp/score_sp_abs_gap_mean \
-  --out_csv wandb/cora/multinomial_diffusion/controller/grid_cora_norm_summary.csv
+  --out_csv wandb/cora/multinomial_diffusion/controller/${EDGE_CONTROLLER_GRID_PREFIX}_summary.csv
 ```
 
 Draw the LP AUC vs score-SP Pareto curve:
 
 ```bash
 python scripts/plot_controller_grid_pareto.py \
-  --summary_csv wandb/cora/multinomial_diffusion/controller/grid_cora_norm_summary.csv \
-  --out_path wandb/cora/multinomial_diffusion/controller/grid_cora_norm_pareto_lp_auc_vs_score_sp.jpg \
+  --summary_csv wandb/cora/multinomial_diffusion/controller/${EDGE_CONTROLLER_GRID_PREFIX}_summary.csv \
+  --out_path wandb/cora/multinomial_diffusion/controller/${EDGE_CONTROLLER_GRID_PREFIX}_pareto_lp_auc_vs_score_sp.jpg \
   --x_metric lp/score_sp_abs_gap_mean \
   --y_metric lp/auc_mean \
   --label_points front \
@@ -330,7 +337,7 @@ python scripts/plot_controller_grid_pareto.py \
 The plot script also writes the Pareto front rows to:
 
 ```text
-wandb/cora/multinomial_diffusion/controller/grid_cora_norm_pareto_lp_auc_vs_score_sp.front.csv
+wandb/cora/multinomial_diffusion/controller/<EDGE_CONTROLLER_GRID_PREFIX>_pareto_lp_auc_vs_score_sp.front.csv
 ```
 
 ## Notes
