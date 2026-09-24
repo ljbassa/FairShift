@@ -53,7 +53,7 @@ examples and regression tests, while preserving the aggregate repository's varia
 FairWire diffusion-step selection and normalized stateful SP guidance. The existing folder guides are extended
 in place. Standalone source updates do not replace a more capable aggregate implementation.
 
-Dataset files, trained checkpoints and experiment results must be prepared separately. `.gitignore` excludes
+Dataset files, trained checkpoints and experiment results must be prepared separately. Code synchronization excludes
 generated artifacts even when a standalone source repository previously tracked them. JSON/YAML configuration
 examples and the small ORCA input fixtures remain source inputs. No reported experiment outputs are bundled.
 
