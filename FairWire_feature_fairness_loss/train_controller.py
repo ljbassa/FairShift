@@ -13,6 +13,7 @@ from data import load_dataset, load_datasets_nc, preprocess
 from Model import ModelSync
 from sample import build_pyg_data_from_sample
 from setup_utils import set_seed
+from fairness_options import metric_directory
 
 
 def torch_load(path, map_location="cpu"):
@@ -109,6 +110,8 @@ def build_model(args, checkpoint, device):
         gnn_E_config=train_yaml_data["gnn_E"],
         fair_label_attr=args.fair_label_attr,
         fair_score_eta=args.fair_score_eta,
+        fair_score_metric=args.fair_score_metric,
+        fair_score_eo_min_mass=args.fair_score_eo_min_mass,
         fair_score_k=args.fair_score_k,
         fair_score_eta_scale=args.fair_score_eta_scale,
         fair_score_controller_train=True,
@@ -150,10 +153,11 @@ def fixed_sample_kwargs(model):
 
 def make_log_dir(args, dataset):
     if args.out_dir is not None and args.log_home is None:
-        log_dir = args.out_dir
+        log_dir = str(metric_directory(args.out_dir, args.fair_score_metric))
     else:
         log_base = args.log_home if args.log_home is not None else "./wandb"
-        log_dir = os.path.join(log_base, dataset, "Sync", "controller", args.name)
+        controller_root = getattr(args, "controller_root", None) or os.path.join(log_base, dataset, "Sync", "controller")
+        log_dir = str(metric_directory(controller_root, args.fair_score_metric) / args.name)
     check_dir = os.path.join(log_dir, "check")
     os.makedirs(check_dir, exist_ok=True)
     with open(os.path.join(log_dir, "args.json"), "w", encoding="utf-8") as f:
@@ -163,8 +167,9 @@ def make_log_dir(args, dataset):
 
 
 def write_latest_run_manifest(args, dataset, log_dir, check_dir):
-    controller_root = Path(log_dir).parent
+    controller_root = Path(log_dir) if args.out_dir is not None and args.log_home is None else Path(log_dir).parent
     manifest = {
+        "fair_score_metric": args.fair_score_metric,
         "dataset": dataset,
         "name": args.name,
         "log_dir": log_dir,
@@ -177,6 +182,7 @@ def write_latest_run_manifest(args, dataset, log_dir, check_dir):
             f"--model_path {os.path.join(check_dir, 'full_model_best.pt')} "
             f"--num_samples {args.num_generation} "
             "--fair_score_sp "
+            f"--fair_score_metric {args.fair_score_metric} "
             f"--save_samples --save_dir {os.path.join(log_dir, 'generated_samples')} "
             f"--device {args.device} "
             "--skip_internal_eval"
@@ -462,6 +468,7 @@ def save_generated_graphs_for_lp(args, model, log_dir, tag, epoch, checkpoint_pa
         eval_command += ["--lp_batch_size", str(args.generated_eval_lp_batch_size)]
     eval_command_text = " ".join(eval_command)
     meta = {
+        "fair_score_metric": args.fair_score_metric,
         "tag": tag,
         "epoch": int(epoch) if epoch is not None else None,
         "num_graphs": len(generated_graphs),
@@ -498,6 +505,7 @@ def main():
     parser.add_argument("--name", type=str, default=None)
     parser.add_argument("--log_home", type=str, default=None)
     parser.add_argument("--out_dir", type=str, default=None)
+    parser.add_argument("--controller_root", type=str, default=None, help="Controller output root; results use <root>/<metric>/<name>.")
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--device", type=str, default=None, help="Torch device override, e.g. cuda:1 or cpu.")
     parser.add_argument("--seed", type=int, default=0)
@@ -522,6 +530,8 @@ def main():
     parser.add_argument("--cpu_offload_generated", type=eval, default=True)
     parser.add_argument("--empty_cache_after_sampling", type=eval, default=True)
     parser.add_argument("--fair_score_eta", type=float, default=0.0)
+    parser.add_argument("--fair_score_metric", choices=["sp", "eo"], default="sp")
+    parser.add_argument("--fair_score_eo_min_mass", type=float, default=1e-6)
     parser.add_argument("--fair_score_k", type=float, default=0.15)
     parser.add_argument("--fair_score_eta_scale", type=float, default=1.0)
     parser.add_argument("--fair_score_learn_k", type=eval, default=True)
@@ -621,7 +631,7 @@ def main():
         optimizer.step()
         last_loss = loss.detach()
 
-        row = {"epoch": epoch + 1, "loss": float(last_loss.cpu()), **stats}
+        row = {"epoch": epoch + 1, "loss": float(last_loss.cpu()), "fair_score_metric": args.fair_score_metric, **stats}
         print("Controller epoch {}/{} | loss {:.6f} | fair {:.6f} | k_track {:.6f} | util {:.6f}".format(
             epoch + 1,
             args.controller_epochs,
@@ -718,6 +728,7 @@ def main():
             f"--model_path {best_full_path} "
             f"--num_samples {args.num_generation} "
             "--fair_score_sp "
+            f"--fair_score_metric {args.fair_score_metric} "
             f"--save_samples --save_dir {os.path.join(log_dir, 'generated_samples')} "
             f"--device {args.device} "
             "--skip_internal_eval"

@@ -13,6 +13,7 @@ from torch_geometric.data import Data
 from data import load_dataset, preprocess, load_datasets_nc
 from eval_utils import Evaluator
 from setup_utils import set_seed
+from fairness_options import metric_directory, metric_file, resolve_controller_metric
 
 
 CHECKPOINT_FALLBACK_NAMES = (
@@ -190,6 +191,9 @@ def sanitize_tag_value(value):
 
 def build_sample_tag(args, controller_enabled: bool):
     stem = Path(getattr(args, "sample_source_path", args.model_path)).stem
+    metric = getattr(args, "fair_score_metric", None) or "sp"
+    metric_enabled = bool(controller_enabled or getattr(args, "fair_score_sp", False) or getattr(args, "sp_shift", False) or metric == "eo")
+    metric_tag = f"_{metric}" if metric_enabled else ""
     eta_tag = "controller" if controller_enabled else (
         getattr(args, 'fair_score_eta', None)
         if getattr(args, 'fair_score_eta', None) is not None
@@ -206,6 +210,7 @@ def build_sample_tag(args, controller_enabled: bool):
         f"_eta{sanitize_tag_value(eta_tag)}"
         f"_k{sanitize_tag_value(k_tag)}"
         f"_ctrl{int(bool(controller_enabled))}"
+        f"{metric_tag}"
     )
 
 
@@ -297,22 +302,23 @@ def print_sp_shift_report(sample_idx: int, sp_stats):
         print(f"[SP guidance] sample {sample_idx:03d}: no per-step stats recorded")
         return
 
-    print(f"[SP guidance] sample {sample_idx:03d}")
+    metric = sp_stats[0].get("fair_score_metric", "sp")
+    print(f"[{metric.upper()} guidance] sample {sample_idx:03d}")
     for stat in sp_stats:
         parts = [
             f"t={stat.get('t')}",
             f"eta_t={stat.get('eta_t', 0.0):.6g}",
             f"k={stat.get('sp_k', 0.0):.6g}",
-            f"delta_sp_before={stat.get('delta_sp_before', 0.0):.6g}",
-            f"abs_before={stat.get('abs_delta_sp_before', 0.0):.6g}",
+            f"delta_{metric}_before={stat.get(f'delta_{metric}_before', 0.0):.6g}",
+            f"abs_before={stat.get(f'abs_delta_{metric}_before', 0.0):.6g}",
             f"n_same={stat.get('n_same', 0)}",
             f"n_diff={stat.get('n_diff', 0)}",
             f"shift_applied={stat.get('shift_applied', False)}",
         ]
-        if "delta_sp_after_prior" in stat:
+        if f"delta_{metric}_after_prior" in stat:
             parts.extend([
-                f"delta_sp_after_prior={stat.get('delta_sp_after_prior', 0.0):.6g}",
-                f"abs_after_prior={stat.get('abs_delta_sp_after_prior', 0.0):.6g}",
+                f"delta_{metric}_after_prior={stat.get(f'delta_{metric}_after_prior', 0.0):.6g}",
+                f"abs_after_prior={stat.get(f'abs_delta_{metric}_after_prior', 0.0):.6g}",
             ])
         print("  " + " | ".join(parts))
 
@@ -580,6 +586,12 @@ def main(args):
     else:
         controller_checkpoint = extract_controller_checkpoint(state_dict)
     controller_enabled = extract_controller_checkpoint(controller_checkpoint) is not None
+    saved_metric = controller_option(controller_checkpoint, "fair_score_metric", default="sp") if controller_enabled else None
+    args.fair_score_metric = resolve_controller_metric(args.fair_score_metric, saved_metric)
+    if args.fair_score_eo_min_mass is None:
+        args.fair_score_eo_min_mass = float_controller_option(
+            controller_checkpoint, "fair_score_eo_min_mass", default=1e-6
+        )
 
     model_fair_score_eta = args.fair_score_eta if args.fair_score_eta is not None else args.sp_eta
     model_fair_score_k = args.fair_score_k if args.fair_score_k is not None else args.sp_k
@@ -624,6 +636,8 @@ def main(args):
         gnn_E_config=train_yaml_data["gnn_E"],
         fair_label_attr=model_fair_label_attr,
         fair_score_eta=model_fair_score_eta,
+        fair_score_metric=args.fair_score_metric,
+        fair_score_eo_min_mass=args.fair_score_eo_min_mass,
         fair_score_k=model_fair_score_k,
         fair_score_eta_scale=args.fair_score_eta_scale,
         fair_score_controller_train=controller_enabled,
@@ -641,6 +655,7 @@ def main(args):
 
     if controller_enabled:
         model.load_fair_controller_state_dict(extract_controller_checkpoint(controller_checkpoint), strict=True)
+        model.fair_score_eo_min_mass = max(float(args.fair_score_eo_min_mass), 0.0)
         print("[controller] loaded fair eta/k controller")
 
     model.to(device)
@@ -652,17 +667,24 @@ def main(args):
     saved_eval_graphs = []
     saved_nx_eval_graphs = []
     saved_nx_full_graphs = []
+    metric_outputs = bool(args.sp_shift or args.fair_score_sp or controller_enabled or args.fair_score_metric == "eo")
 
     if args.save_pkl_dir is not None:
+        if metric_outputs:
+            args.save_pkl_dir = str(metric_directory(args.save_pkl_dir, args.fair_score_metric))
         Path(args.save_pkl_dir).mkdir(parents=True, exist_ok=True)
 
     if args.save_pt_path is not None:
+        if metric_outputs:
+            args.save_pt_path = str(metric_file(args.save_pt_path, args.fair_score_metric))
         Path(args.save_pt_path).parent.mkdir(parents=True, exist_ok=True)
 
     save_root = None
     if args.save_samples:
         source_path = getattr(args, "sample_source_path", args.model_path)
         save_root = Path(args.save_dir) if args.save_dir is not None else Path(os.path.dirname(source_path)) / "generated_samples"
+        if metric_outputs:
+            save_root = metric_directory(save_root, args.fair_score_metric)
         save_root.mkdir(parents=True, exist_ok=True)
 
     guidance_enabled = bool(args.sp_shift or args.fair_score_sp or controller_enabled)
@@ -813,6 +835,8 @@ def main(args):
             saved_files["nx_full_pkl"] = str(nx_full_path)
 
         meta = {
+            "fair_score_metric": args.fair_score_metric,
+            "fair_score_eo_min_mass": args.fair_score_eo_min_mass,
             "model_path": args.model_path,
             "sample_source_path": getattr(args, "sample_source_path", args.model_path),
             "dataset": dataset,
@@ -863,7 +887,11 @@ if __name__ == "__main__":
     parser.add_argument("--allow_checkpoint_search", type=str2bool, default=True,
                         help="If --model_path is missing, search local FairWire controller output dirs for a compatible checkpoint.")
     parser.add_argument("--fair_score_sp", action="store_true",
-                        help="Apply EDGE-style score statistical-parity guidance during sampling.")
+                        help="Apply EDGE-style guidance using --fair_score_metric during sampling.")
+    parser.add_argument("--fair_score_metric", choices=["sp", "eo"], default=None,
+                        help="Guidance metric; defaults to controller checkpoint metric, otherwise sp.")
+    parser.add_argument("--fair_score_eo_min_mass", type=float, default=None,
+                        help="Minimum EO positive mass; defaults to checkpoint value or 1e-6.")
     parser.add_argument("--fair_score_eta", type=float, default=None,
                         help="Static eta for score-SP guidance, or initial eta when loading a controller.")
     parser.add_argument("--fair_score_k", type=float, default=None,

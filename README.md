@@ -20,7 +20,8 @@ Generated artifacts such as plots, CSV files, logs, checkpoints, cached files, a
 
 ## SP and equal opportunity (EO)
 
-The EDGE variants now support choosing the fairness target with `--fair_score_metric sp|eo`; SP remains the default.
+The EDGE variants and `FairWire_feature_fairness_loss` support choosing the fairness target with
+`--fair_score_metric sp|eo`; SP remains the default.
 The existing folder READMEs include commands, required input assets, and output paths:
 
 | Folder | EO support | Instructions |
@@ -28,20 +29,22 @@ The existing folder READMEs include commands, required input assets, and output 
 | `EDGE_fairness` | Fixed sampling-time EO guidance and LP evaluation | [EO grid and baseline](EDGE_fairness/README.md#equal-opportunity-eo-guidance) |
 | `EDGE_fairness_loss` | Learned Stage-2 EO controller and LP evaluation | [Controller and grid guide](EDGE_fairness_loss/README.md) |
 | `FairWire_feature` | LP evaluation of EO | [Evaluation guide](FairWire_feature/README.md) |
-| `FairWire_feature_shift` | LP evaluation of EO; sampling guidance targets SP | [Evaluation guide](FairWire_feature_shift/README.md) |
-| `FairWire_feature_fairness_loss` | LP evaluation of EO; controller targets SP | [Evaluation guide](FairWire_feature_fairness_loss/README.md) |
+| `FairWire_feature_shift` | LP evaluation of EO; sampling guidance targets SP | [Evaluation and Pareto guide](FairWire_feature_shift/README.md#eo-pareto-selection-and-guidance) |
+| `FairWire_feature_fairness_loss` | Learned Stage-2 EO controller, fixed EO guidance and LP evaluation | [Controller, grid and sampling guide](FairWire_feature_fairness_loss/README.md#sp--eo-controller-selection) |
 | `FairWire_fairness_loss` | LP evaluation of EO; controller targets SP | [Evaluation guide](FairWire_fairness_loss/README.md) |
 | `FairWire_shift` | LP evaluation of EO; sampling guidance targets SP | [Evaluation guide](FairWire_shift/README.md) |
 
 Here EO is a soft-score gap on positive edges: the absolute difference in mean link-prediction scores between
 same-group and different-group pairs. It is not a thresholded true-positive-rate gap or an equalized-odds metric.
-The EDGE training/sampling surrogate uses detached soft-positive weights from the unguided denoiser; downstream
+The EDGE and feature-controller training/sampling surrogates use detached soft-positive weights from the unguided denoiser; downstream
 evaluation uses actual held-out positive edges. These quantities have different roles and need not move together.
 Use `lp/eo_abs_gap_mean` for the per-graph-averaged downstream EO gap, together with `lp/auc_mean` for utility.
 Missing positive comparison groups produce an undefined EO value, not evidence of a zero gap.
 
-The EDGE tools separate SP and EO outputs into `sp/` and `eo/` subdirectories. The FairWire variants retain their
-own CLI and output conventions; the EDGE `--fair_score_metric eo` switch does not apply to them.
+The EDGE tools and `FairWire_feature_fairness_loss` separate SP and EO outputs into `sp/` and `eo/`
+subdirectories. Other FairWire folders retain their own CLI and output conventions; check their individual
+guides before using `--fair_score_metric eo`. The feature shift sampler continues to apply SP guidance,
+while its evaluator reports both SP and EO.
 
 ## Code synchronization and local execution
 

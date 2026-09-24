@@ -10,6 +10,11 @@ pip install -r requirements.txt
 
 Run the commands below from the `FairWire_feature_fairness_loss` directory.
 
+The feature variant keeps the input node features, sensitive attributes, and
+labels fixed while generating edges. Its edge denoiser also receives the original
+node features. Stage 2 freezes that denoiser and learns the fairness controller
+from recorded reverse-diffusion trajectories.
+
 ## 1. Required Inputs
 
 Before training a controller, prepare:
@@ -105,7 +110,7 @@ python train_controller.py \
 Typical outputs are written under:
 
 ```text
-wandb/cora/Sync/controller/<FW_FEATURE_CONTROLLER_RUN_NAME>/
+wandb/cora/Sync/controller/sp/<FW_FEATURE_CONTROLLER_RUN_NAME>/
 ```
 
 Important files include:
@@ -163,16 +168,105 @@ python scripts/run_controller_grid.py \
   --skip_existing
 ```
 
-The grid writes outputs under `wandb/cora/Sync/controller/`, including:
+The grid writes outputs under `wandb/cora/Sync/controller/sp/`, including:
 
 - `<FW_FEATURE_CONTROLLER_GRID_PREFIX>_manifest.jsonl`
 - `<FW_FEATURE_CONTROLLER_GRID_PREFIX>_summary.csv`
-- `<FW_FEATURE_CONTROLLER_GRID_PREFIX>_pareto_lp_auc_vs_score_sp.jpg`
-- `<FW_FEATURE_CONTROLLER_GRID_PREFIX>_pareto_lp_auc_vs_score_sp.front.csv`
+- `<FW_FEATURE_CONTROLLER_GRID_PREFIX>_pareto_lp_auc_vs_sp.jpg`
+- `<FW_FEATURE_CONTROLLER_GRID_PREFIX>_pareto_lp_auc_vs_sp.front.csv`
+
+Without `--controller_root`, the grid infers the dataset from checkpoint folders
+named `<dataset>_<aA>_<aX>_cpts` and uses
+`<log_home>/<dataset>/Sync/controller/<metric>/`. For other checkpoint layouts,
+pass `--dataset citeseer` (or the matching dataset); the fallback is `cora`.
+`--pareto_title` overrides the dataset-based plot title. The feature grid also
+supports `--pareto_front_csv` and `--pareto_extra_summary_csv` for custom front
+exports and merging earlier grid summaries.
+
+## SP / EO controller selection
+
+Add `--fair_score_metric eo` to `train_controller.py` or
+`scripts/run_controller_grid.py` to train an EO controller. The default is `sp`;
+the existing SP objective and feature handling are unchanged. EO compares the
+running scores of same-group and different-group pairs, weighted by an independent
+unguided denoiser EMA. These positive-condition weights are detached from the
+controller. `--fair_score_eo_min_mass 1e-6` masks groups with insufficient positive
+mass.
+
+Here EO means equal opportunity on positive edges. For each pair group `g`,
+the training proxy is `sum(w_e * q_e) / sum(w_e)`, with `q_e` the guided running
+probability and `w_e` the detached unguided positive-edge weight. The proxy gap
+compares same-group and different-group pairs, using `--fair_label_attr y` by
+default (`s` selects sensitive attributes). If either group is empty or has
+positive mass at or below the threshold, its graph contributes zero fairness
+loss and guidance. This proxy differs from the reported `lp/eo_abs_gap_mean`:
+LP evaluation compares predicted link scores on actual held-out positive edges.
+
+Training outputs, checkpoints, generated graphs, grid manifests, summaries, and
+plots use `controller/sp/<name>/` or `controller/eo/<name>/`. Explicit `--out_dir`
+without `--log_home` uses `<out_dir>/<metric>/`. Metric-specific `latest_run.json` files are written
+inside the corresponding metric directory. For an EO grid, omit the example's
+`--pareto_x_metric` override so it automatically uses `lp/eo_abs_gap_mean`.
+Standalone summary and plot scripts also accept `--fair_score_metric eo`.
+
+`sample.py` restores the metric and positive-mass threshold from the controller
+checkpoint. Legacy checkpoints default to SP. An explicit conflicting metric is
+rejected. For static EO guidance, pass `--fair_score_sp --fair_score_metric eo`.
+Guided sample exports use an `sp/` or `eo/` subdirectory of the requested save directory
+(including `--save_pkl_dir` and the parent of `--save_pt_path`).
+
+For example, using the Cora feature checkpoint prepared above:
+
+```bash
+export FW_FEATURE_EO_RUN=cora_feature_eo
+
+python train_controller.py \
+  --controller_pretrained_ckpt "$FEATURE_STAGE1_AA0_CKPT" \
+  --name "$FW_FEATURE_EO_RUN" --log_home ./wandb --device cuda:0 \
+  --fair_score_metric eo --fair_score_eo_min_mass 1e-6 --fair_label_attr y \
+  --fair_score_eta 0.005 --fair_score_k 0.15 \
+  --fair_score_learn_k False --fair_score_learn_eta True \
+  --fair_score_fair_loss_weight 1e5 --fair_score_k_tracking_loss_weight 0.0 \
+  --fair_score_utility_loss_weight 0.1 --run_generated_eval
+
+python scripts/run_controller_grid.py \
+  --stage1_ckpt "$FEATURE_STAGE1_AA0_CKPT" --dataset cora \
+  --name_prefix "${FW_FEATURE_EO_RUN}_grid" --device cuda:0 \
+  --fair_score_metric eo --eta_values 0.005 0.01 \
+  --fair_score_k_values 0.1 0.15 --run_generated_eval
+
+python sample.py \
+  --model_path "wandb/cora/Sync/controller/eo/${FW_FEATURE_EO_RUN}/check/controller_best.pt" \
+  --device cuda:0 --num_samples 64 --save_samples --save_dir generated_samples
+```
+
+The sampling command restores EO from the checkpoint and writes to
+`generated_samples/eo/`. For fixed guidance without a trained controller, use:
+
+```bash
+python sample.py --model_path "$FEATURE_STAGE1_AA0_CKPT" \
+  --fair_score_sp --fair_score_metric eo --fair_score_eta 0.005 --fair_score_k 0.15 \
+  --device cuda:0 --save_samples --save_dir generated_samples
+```
+
+The EO implementation is in `Model/fairness_surrogate.py` and
+`Model/fair_diffusion.py`; `fairness_options.py` handles metric selection and
+output paths. The controller entry points and grid/summary/plot scripts carry
+these options through training, sampling, and evaluation.
+
+CPU checks for the fairness calculations, checkpoint compatibility, and metric
+output separation can be run with `python -m pytest -q tests`.
+
+## Code-only synchronization
+
+FairShift includes source, configuration, dependency files, tests, and this
+README. Checkpoints, datasets, reference graph pickles, generated graphs,
+`wandb/`, result CSVs, plots, logs, and Python caches are excluded. Prepare the
+inputs locally and generate evaluation outputs with the commands above.
 
 ## EO (Equal Opportunity) 평가와 사용법
 
-현재 feature controller는 고정된 노드 특징과 라벨을 사용하여 SP 보정을 학습합니다. `--fair_score_fair_loss_weight`는 SP controller 손실의 가중치이며, EO는 생성 그래프의 **평가 지표**입니다. 이 폴더에는 EO controller 목적함수를 선택하는 옵션이 없습니다.
+현재 feature controller는 고정된 노드 특징과 라벨을 사용하여 SP 또는 EO 보정을 학습합니다. `--fair_score_metric eo`로 EO 목적을 선택하고, `--fair_score_fair_loss_weight`로 선택한 fairness 손실의 가중치를 조절합니다. 학습 proxy와 아래의 생성 그래프 EO 평가 지표는 구분해야 합니다. 구체적인 학습·grid·샘플링 명령은 위의 [SP / EO controller selection](#sp--eo-controller-selection)을 참고합니다.
 
 `evaluate_generated_graphs.py`의 `samplepy_group_fairness()`는 생성 그래프의
 held-out 양성 간선(`Y_uv=1`)에서 다음 값을 계산합니다.
@@ -228,3 +322,7 @@ test 쌍의 AUC/SP/EO를 함께 기록합니다. 실행에는 GAE 학습이 포�
 평가하려면 `FW_CKPT`를 해당 run의 `full_model_best.pt`로 바꾸거나,
 Stage-1 경로와 `--controller_path`를 함께 지정합니다. 기존
 `train_controller.py --run_generated_eval` 경로도 EO 열을 함께 출력합니다.
+
+Controller를 사용하면 `--save_pt_path`의 부모 아래에 `sp/` 또는 `eo/`가
+추가됩니다. 예를 들어 EO controller로 위 파일을 저장했다면 평가기의
+`--graph_path`는 `saved_generated/eo/cora_eo_check.pyg.pt`로 바꿉니다.

@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .gnn import *
+from .fairness_surrogate import group_fairness_terms, normalize_fair_score_metric
 
 __all__ = ["ModelSync"]
 eps = 1e-8
@@ -211,7 +212,9 @@ class BaseModel(nn.Module):
                  fair_score_guidance_normalize=True,
                  fair_score_fair_loss_weight=1.0,
                  fair_score_k_tracking_loss_weight=1.0,
-                 fair_score_utility_loss_weight=1.0):
+                 fair_score_utility_loss_weight=1.0,
+                 fair_score_metric="sp",
+                 fair_score_eo_min_mass=1e-6):
         super().__init__()
 
         device = E_marginal.device
@@ -232,6 +235,8 @@ class BaseModel(nn.Module):
         self.X_marginal = X_marginal
         self.E_marginal = E_marginal
         self.fair_label_attr = fair_label_attr
+        self.fair_score_metric = normalize_fair_score_metric(fair_score_metric)
+        self.fair_score_eo_min_mass = max(float(fair_score_eo_min_mass), 0.0)
         self.fair_score_eta = float(fair_score_eta)
         self.fair_score_k = float(fair_score_k)
         self.fair_score_eta_scale = max(float(fair_score_eta_scale), 1e-8)
@@ -405,6 +410,11 @@ class BaseModel(nn.Module):
             "_fair_score_q",
             "_fair_score_R1",
             "_fair_score_R0",
+            "_fair_condition_h",
+            "_fair_score_C1",
+            "_fair_score_C0",
+            "_fair_score_U1",
+            "_fair_score_U0",
         ):
             if hasattr(self, name):
                 delattr(self, name)
@@ -452,6 +462,12 @@ class BaseModel(nn.Module):
         self._fair_score_q = rho_edge.clone()
         self._fair_score_R1 = (self._fair_score_q * mask_float).sum()
         self._fair_score_R0 = (self._fair_score_q * inv_mask_float).sum()
+        if self.fair_score_metric == "eo":
+            self._fair_condition_h = self._fair_score_h.detach().clone()
+            self._fair_score_C1 = self._fair_score_R1.detach().clone()
+            self._fair_score_C0 = self._fair_score_R0.detach().clone()
+            self._fair_score_U1 = (rho_edge.square() * mask_float).sum()
+            self._fair_score_U0 = (rho_edge.square() * inv_mask_float).sum()
 
     def _build_controller_replay_header(self, s_0=None, y_0=None, edge_group_labels=None, E_init=None, X_init=None):
         def _clone_or_none(value):
@@ -487,6 +503,11 @@ class BaseModel(nn.Module):
         N0,
         mask_active,
         k_active,
+        condition_h_active=None,
+        C1=None,
+        C0=None,
+        U1=None,
+        U0=None,
     ):
         dtype = z_active.dtype
         device = z_active.device
@@ -506,6 +527,39 @@ class BaseModel(nn.Module):
         delta_pre = R1_pre / safe_N1 - R0_pre / safe_N0
 
         a_e = mask_float / safe_N1 - inv_mask_float / safe_N0
+        eo_diagnostics = {}
+        if self.fair_score_metric == "eo":
+            # The positive condition follows the unguided EMA, independently of
+            # the controller's guided score. Neither eta nor k differentiates it.
+            condition_h_pre = condition_h_active.detach() + k_active.detach() * (
+                z_active.detach() - condition_h_active.detach()
+            )
+            w_prev = torch.sigmoid(condition_h_active.detach())
+            w_pre = torch.sigmoid(condition_h_pre).detach()
+            delta_w = w_pre - w_prev
+            C1_pre = C1 + (delta_w * mask_float).sum()
+            C0_pre = C0 + (delta_w * inv_mask_float).sum()
+            delta_u = w_pre * q_pre - w_prev * q_prev
+            U1_pre = U1 + (delta_u * mask_float).sum()
+            U0_pre = U0 + (delta_u * inv_mask_float).sum()
+            fairness = group_fairness_terms(
+                "eo", R1_pre.reshape(1), R0_pre.reshape(1),
+                C1_pre.reshape(1), C0_pre.reshape(1),
+                U1_pre.reshape(1), U0_pre.reshape(1), N1.reshape(1), N0.reshape(1),
+                q_active=q_pre, positive_weight_active=w_pre,
+                batch_active=torch.zeros_like(mask_active, dtype=torch.long),
+                same_active=mask_active, min_positive_mass=self.fair_score_eo_min_mass,
+            )
+            delta_pre = fairness["gap"].squeeze(0)
+            a_e = fairness["derivative"]
+            eo_diagnostics = {
+                "condition_h_pre": condition_h_pre.detach(),
+                "w_prev": w_prev.detach(),
+                "w_pre": w_pre,
+                "C1_pre": C1_pre.detach(),
+                "C0_pre": C0_pre.detach(),
+                "valid_guidance": bool(fairness["valid_graph"].item()),
+            }
 
         if self.fair_score_guidance_normalize:
             grad_raw = delta_pre * a_e * k_active * q_pre * (1.0 - q_pre)
@@ -521,6 +575,8 @@ class BaseModel(nn.Module):
                 grad = grad_raw
         else:
             step_scale = 0.5 * (N1 + N0)
+            if self.fair_score_metric == "eo":
+                step_scale = 0.5 * (C1_pre + C0_pre)
             a_bar = step_scale * a_e
             grad_raw = delta_pre * a_bar * k_active * q_pre * (1.0 - q_pre)
             grad_scale = torch.ones_like(grad_raw)
@@ -545,6 +601,7 @@ class BaseModel(nn.Module):
             "grad_raw_abs_mean": grad_raw.detach().abs().mean() if grad_raw.numel() > 0 else zero.detach(),
             "grad_dir_abs_mean": grad.detach().abs().mean() if grad.numel() > 0 else zero.detach(),
         }
+        diagnostics.update(eo_diagnostics)
         return grad.detach(), diagnostics
 
     def _apply_score_sp_guidance(self,
@@ -573,7 +630,17 @@ class BaseModel(nn.Module):
         z_raw = logit_E[:, 1] - logit_E[:, 0]
         k_active = k.expand_as(z_raw)
 
+        eo_kwargs = {}
+        if self.fair_score_metric == "eo":
+            eo_kwargs = {
+                "condition_h_active": self._fair_condition_h[edge_ids].to(device=device, dtype=dtype),
+                "C1": self._fair_score_C1.to(device=device, dtype=dtype),
+                "C0": self._fair_score_C0.to(device=device, dtype=dtype),
+                "U1": self._fair_score_U1.to(device=device, dtype=dtype),
+                "U0": self._fair_score_U0.to(device=device, dtype=dtype),
+            }
         grad_dir, diagnostics = self._compute_fair_controller_guidance(
+            **eo_kwargs,
             z_active=z_raw,
             h_active=h_prev,
             R1=r1,
@@ -604,8 +671,17 @@ class BaseModel(nn.Module):
         self._fair_score_R0 = self._fair_score_R0 + (
             delta_q_new * inv_mask_float).sum().to(dtype=self._fair_score_R0.dtype)
 
+        if self.fair_score_metric == "eo":
+            self._fair_condition_h[edge_ids] = diagnostics["condition_h_pre"].to(self._fair_condition_h)
+            self._fair_score_C1 = diagnostics["C1_pre"]
+            self._fair_score_C0 = diagnostics["C0_pre"]
+            delta_u = diagnostics["w_pre"] * q_new - diagnostics["w_prev"] * q_prev
+            self._fair_score_U1 = self._fair_score_U1 + (delta_u * mask_float).sum()
+            self._fair_score_U0 = self._fair_score_U0 + (delta_u * inv_mask_float).sum()
+
         trace = {
-            "fair_score_sp_enabled": True,
+            "fair_score_metric": self.fair_score_metric,
+            "fair_score_sp_enabled": self.fair_score_metric == "sp",
             "fair_score_k": float(k.detach().cpu()),
             "fair_score_eta": float(eta.detach().cpu()),
             "fair_score_delta_sp": diagnostics["delta_pre"],
@@ -614,6 +690,10 @@ class BaseModel(nn.Module):
             "fair_score_mean_abs_logit_shift": (eta * grad_dir).detach().abs().mean().item(),
             "valid_guidance": bool((n1 > 0).item() and (n0 > 0).item()),
         }
+        if self.fair_score_metric == "eo":
+            trace["fair_score_eo_enabled"] = True
+            trace["fair_score_delta_eo"] = trace.pop("fair_score_delta_sp")
+            trace["valid_guidance"] = diagnostics["valid_guidance"]
         return log_model_prob_edge, trace
 
     def compute_fair_controller_loss_from_replay(self, replay):
@@ -625,6 +705,14 @@ class BaseModel(nn.Module):
         N1 = replay["N1"].to(device=device, dtype=dtype)
         N0 = replay["N0"].to(device=device, dtype=dtype)
         full_mask = replay["full_mask"].to(device=device, dtype=torch.bool)
+        if self.fair_score_metric == "eo":
+            condition_h = replay.get("condition_h_init", replay["h_init"]).to(device=device, dtype=dtype).detach()
+            w_init = torch.sigmoid(condition_h)
+            q_init = torch.sigmoid(h)
+            C1 = (w_init * full_mask).sum()
+            C0 = (w_init * (~full_mask)).sum()
+            U1 = (w_init * q_init * full_mask).sum()
+            U0 = (w_init * q_init * (~full_mask)).sum()
 
         k_all = self._get_effective_fair_score_k().to(device=device, dtype=dtype)
         eta_all = self._get_effective_fair_score_eta().to(device=device, dtype=dtype)
@@ -665,7 +753,14 @@ class BaseModel(nn.Module):
             k_active = k_t.expand_as(z_raw)
             eta_active = eta_t.expand_as(z_raw)
 
+            eo_kwargs = {}
+            if self.fair_score_metric == "eo":
+                eo_kwargs = {
+                    "condition_h_active": condition_h.index_select(0, edge_ids),
+                    "C1": C1, "C0": C0, "U1": U1, "U0": U0,
+                }
             grad_dir, diagnostics = self._compute_fair_controller_guidance(
+                **eo_kwargs,
                 z_active=z_raw,
                 h_active=h_active,
                 R1=R1,
@@ -688,6 +783,12 @@ class BaseModel(nn.Module):
             R1 = R1 + (delta_q * mask_float).sum()
             R0 = R0 + (delta_q * inv_mask_float).sum()
             h = h.index_copy(0, edge_ids, h_new_fair)
+            if self.fair_score_metric == "eo":
+                condition_h = condition_h.index_copy(0, edge_ids, diagnostics["condition_h_pre"])
+                C1, C0 = diagnostics["C1_pre"], diagnostics["C0_pre"]
+                delta_u = diagnostics["w_pre"] * q_new_fair - diagnostics["w_prev"] * q_prev
+                U1 = U1 + (delta_u * mask_float).sum()
+                U0 = U0 + (delta_u * inv_mask_float).sum()
 
             pi_raw = torch.sigmoid(z_raw.detach())
             h_track = h_active.detach() + k_active * (z_raw.detach() - h_active.detach())
@@ -722,6 +823,14 @@ class BaseModel(nn.Module):
         safe_N0 = torch.where(N0 > 0, N0, torch.ones_like(N0))
         delta_final = R1 / safe_N1 - R0 / safe_N0
         valid_graph = (N1 > 0) & (N0 > 0)
+        if self.fair_score_metric == "eo":
+            fairness = group_fairness_terms(
+                "eo", R1.reshape(1), R0.reshape(1), C1.reshape(1), C0.reshape(1),
+                U1.reshape(1), U0.reshape(1), N1.reshape(1), N0.reshape(1),
+                min_positive_mass=self.fair_score_eo_min_mass,
+            )
+            delta_final = fairness["gap"].squeeze(0)
+            valid_graph = fairness["valid_graph"].squeeze(0)
         fair_loss = 0.5 * delta_final.pow(2) if valid_graph else zero
         delta_final_abs = delta_final.abs() if valid_graph else zero.detach()
 
@@ -769,6 +878,12 @@ class BaseModel(nn.Module):
             "fair_guidance_eta_mean": float(fair_guidance_eta_mean.detach().cpu()),
             "fair_guidance_k_mean": float(fair_guidance_k_mean.detach().cpu()),
         }
+        if self.fair_score_metric == "eo":
+            stats.update({
+                "fair_controller_eo_gap_final_abs_mean": float(delta_final_abs.detach().cpu()),
+                "fair_controller_eo_positive_mass_same": float(C1.detach().cpu()),
+                "fair_controller_eo_positive_mass_diff": float(C0.detach().cpu()),
+            })
         return loss, stats
 
     def freeze_for_fair_controller_training(self):
@@ -802,6 +917,8 @@ class BaseModel(nn.Module):
 
     def get_fair_controller_state_dict(self):
         state = {
+            "fair_score_metric": self.fair_score_metric,
+            "fair_score_eo_min_mass": self.fair_score_eo_min_mass,
             "fair_score_k_mode": "per_step_sigmoid",
             "fair_score_eta_mode": "per_step_multiplier_softplus",
             "fair_score_eta_base": self.fair_score_eta,
@@ -820,6 +937,8 @@ class BaseModel(nn.Module):
     def load_fair_controller_state_dict(self, state_dict, strict=True):
         if "controller" in state_dict:
             state_dict = state_dict["controller"]
+        self.fair_score_metric = normalize_fair_score_metric(state_dict.get("fair_score_metric", "sp"))
+        self.fair_score_eo_min_mass = max(float(state_dict.get("fair_score_eo_min_mass", 1e-6)), 0.0)
         missing = []
         eta_mode = state_dict.get("fair_score_eta_mode")
         for name in ("fair_score_k_raw", "fair_score_eta_raw"):
@@ -1177,7 +1296,7 @@ class BaseModel(nn.Module):
 
             if batch_traces:
                 delta_vals = [
-                    float(trace["fair_score_delta_sp"].detach().cpu().item())
+                    float(trace[f"fair_score_delta_{self.fair_score_metric}"].detach().cpu().item())
                     for trace in batch_traces
                 ]
                 shift_vals = [
@@ -1203,6 +1322,21 @@ class BaseModel(nn.Module):
                 "delta_sp_after_prior": float(delta_sp_after.detach().cpu().item()),
                 "abs_delta_sp_after_prior": abs(float(delta_sp_after.detach().cpu().item())),
             })
+            sp_step_stats["fair_score_metric"] = self.fair_score_metric
+            if self.fair_score_metric == "eo":
+                valid_eo = (self._fair_score_C1 > self.fair_score_eo_min_mass) & (self._fair_score_C0 > self.fair_score_eo_min_mass)
+                valid_eo = valid_eo & (n_same > 0) & (n_diff > 0)
+                c1 = torch.where(valid_eo, self._fair_score_C1, torch.ones_like(self._fair_score_C1))
+                c0 = torch.where(valid_eo, self._fair_score_C0, torch.ones_like(self._fair_score_C0))
+                eo_same = torch.where(valid_eo, self._fair_score_U1 / c1, torch.zeros_like(c1))
+                eo_diff = torch.where(valid_eo, self._fair_score_U0 / c0, torch.zeros_like(c0))
+                sp_step_stats["mean_same_after_prior"] = float(eo_same.detach().cpu())
+                sp_step_stats["mean_diff_after_prior"] = float(eo_diff.detach().cpu())
+                sp_step_stats["delta_sp_after_prior"] = float((eo_same - eo_diff).detach().cpu())
+                sp_step_stats["abs_delta_sp_after_prior"] = abs(sp_step_stats["delta_sp_after_prior"])
+                for key in list(sp_step_stats):
+                    if "delta_sp" in key:
+                        sp_step_stats[key.replace("delta_sp", "delta_eo")] = sp_step_stats.pop(key)
             sp_stats.append(sp_step_stats)
 
         stored_gumbel = None
@@ -1349,7 +1483,9 @@ class ModelSync(BaseModel):
                  fair_score_guidance_normalize=True,
                  fair_score_fair_loss_weight=1.0,
                  fair_score_k_tracking_loss_weight=1.0,
-                 fair_score_utility_loss_weight=1.0):
+                 fair_score_utility_loss_weight=1.0,
+                 fair_score_metric="sp",
+                 fair_score_eo_min_mass=1e-6):
         super().__init__(T=T,
                          X_marginal=X_marginal,
                          s_marginal=s_marginal,
@@ -1366,7 +1502,9 @@ class ModelSync(BaseModel):
                          fair_score_guidance_normalize=fair_score_guidance_normalize,
                          fair_score_fair_loss_weight=fair_score_fair_loss_weight,
                          fair_score_k_tracking_loss_weight=fair_score_k_tracking_loss_weight,
-                         fair_score_utility_loss_weight=fair_score_utility_loss_weight)
+                         fair_score_utility_loss_weight=fair_score_utility_loss_weight,
+                         fair_score_metric=fair_score_metric,
+                         fair_score_eo_min_mass=fair_score_eo_min_mass)
         self.y_marginal = y_marginal
         self.s_marginal = s_marginal
         self.y_cond_s_marginal = y_cond_s_marginal

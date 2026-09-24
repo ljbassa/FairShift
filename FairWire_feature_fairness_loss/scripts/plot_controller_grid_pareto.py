@@ -2,6 +2,7 @@
 import argparse
 import csv
 import math
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -11,12 +12,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from fairness_options import metric_file
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Draw a Pareto curve from a controller-grid summary CSV."
     )
     parser.add_argument("--summary_csv", type=Path, required=True)
+    parser.add_argument("--fair_score_metric", choices=["sp", "eo"], default="sp")
     parser.add_argument(
         "--extra_summary_csv",
         type=Path,
@@ -31,18 +36,23 @@ def parse_args():
     )
     parser.add_argument("--out_path", type=Path, default=None)
     parser.add_argument("--front_csv", type=Path, default=None)
-    parser.add_argument("--x_metric", default="lp/score_sp_abs_gap_mean")
+    parser.add_argument("--x_metric", default=None)
     parser.add_argument("--y_metric", default="lp/auc_mean")
     parser.add_argument("--xerr_metric", default=None)
     parser.add_argument("--yerr_metric", default=None)
-    parser.add_argument("--title", default="Controller LP Pareto: AUC vs score SP gap")
+    parser.add_argument("--title", default=None)
     parser.add_argument("--label_points", choices=["none", "front", "all"], default="front")
     parser.add_argument(
         "--label_fields",
         nargs="+",
         default=["fair_score_k", "fair_score_eta", "fair_weight", "utility_weight"],
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.x_metric is None:
+        args.x_metric = "lp/eo_abs_gap_mean" if args.fair_score_metric == "eo" else "lp/score_sp_abs_gap_mean"
+    if args.title is None:
+        args.title = f"Controller LP Pareto: AUC vs {args.fair_score_metric.upper()} gap"
+    return args
 
 
 def parse_csv_value(value: str) -> Any:
@@ -73,6 +83,8 @@ def dedupe_rows(rows: List[Dict[str, Any]], dedupe_key: str) -> List[Dict[str, A
     for row in rows:
         key_value = row.get(dedupe_key)
         key_text = "" if key_value is None else str(key_value).strip()
+        if key_text:
+            key_text = f"{row.get('fair_score_metric', 'sp')}:{key_text}"
         if not key_text:
             out.append(row)
             continue
@@ -190,6 +202,7 @@ def write_csv(rows: Iterable[Dict[str, Any]], path: Path) -> None:
 def plot_pareto(args) -> Path:
     summary_csv = args.summary_csv.resolve()
     rows = read_merged_summary_rows(summary_csv, args.extra_summary_csv, args.dedupe_key)
+    rows = [row for row in rows if row.get("fair_score_metric", "sp") == args.fair_score_metric]
     valid = [
         row
         for row in rows
@@ -217,7 +230,9 @@ def plot_pareto(args) -> Path:
     ]
 
     out_path = args.out_path.resolve() if args.out_path is not None else default_out_path(summary_csv, args.x_metric, args.y_metric)
+    out_path = metric_file(out_path, args.fair_score_metric)
     front_csv = args.front_csv.resolve() if args.front_csv is not None else out_path.with_suffix(".front.csv")
+    front_csv = metric_file(front_csv, args.fair_score_metric)
 
     plt.figure(figsize=(9, 6))
     plt.errorbar(xs, ys, xerr=xerrs, yerr=yerrs, fmt="o", alpha=0.72, capsize=2, markersize=5)

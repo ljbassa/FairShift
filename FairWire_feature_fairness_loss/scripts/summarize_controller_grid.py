@@ -3,9 +3,13 @@ import argparse
 import csv
 import json
 import math
+import sys
 from pathlib import Path
 
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from fairness_options import metric_directory, metric_file
 
 
 def parse_args():
@@ -16,10 +20,14 @@ def parse_args():
         default=Path("wandb/cora/Sync/controller"),
     )
     parser.add_argument("--prefix", required=True)
+    parser.add_argument("--fair_score_metric", choices=["sp", "eo"], default="sp")
     parser.add_argument("--out_csv", type=Path, default=None)
-    parser.add_argument("--sort_by", default="generated/aggregate_lp/score_sp_abs_gap")
+    parser.add_argument("--sort_by", default=None)
     parser.add_argument("--descending", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.sort_by is None:
+        args.sort_by = "generated/aggregate_lp/eo_abs_gap" if args.fair_score_metric == "eo" else "generated/aggregate_lp/score_sp_abs_gap"
+    return args
 
 
 def read_jsonl_last(path):
@@ -96,7 +104,7 @@ def weighted_terms(row, args):
 
 def main():
     args = parse_args()
-    root = args.controller_root
+    root = metric_directory(args.controller_root, args.fair_score_metric)
     rows = []
 
     for run_dir in sorted(root.glob(f"{args.prefix}*")):
@@ -104,10 +112,13 @@ def main():
             continue
         metrics = read_jsonl_last(run_dir / "controller_metrics.jsonl")
         ckpt_args = load_args_from_checkpoint(run_dir)
+        if ckpt_args.get("fair_score_metric", "sp") != args.fair_score_metric:
+            continue
         lp_summary_path = find_lp_summary(run_dir)
         lp_summary = read_csv_first(lp_summary_path) if lp_summary_path else {}
 
         row = {
+            "fair_score_metric": args.fair_score_metric,
             "run_name": run_dir.name,
             "run_dir": str(run_dir),
             "last_epoch": metrics.get("epoch"),
@@ -158,9 +169,15 @@ def main():
             "lp/score_sp_abs_gap_mean",
             "lp/score_sp_abs_gap_std",
             "lp/sp_abs_gap_mean",
+            "lp/eo_gap_mean",
+            "lp/eo_gap_std",
+            "lp/eo_abs_gap_mean",
+            "lp/eo_abs_gap_std",
             "aggregate_lp/auc",
             "aggregate_lp/score_sp_abs_gap",
             "aggregate_lp/sp_abs_gap",
+            "aggregate_lp/eo_gap",
+            "aggregate_lp/eo_abs_gap",
             "aggregate_value/linkpred_auc",
             "aggregate_fair_abs_gap",
         ]
@@ -184,6 +201,7 @@ def main():
     )
 
     out_csv = args.out_csv or (root / f"{args.prefix}_summary.csv")
+    out_csv = metric_file(out_csv, args.fair_score_metric)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = []
     seen = set()
@@ -208,7 +226,7 @@ def main():
         "fair_weight",
         "utility_weight",
         "generated/aggregate_lp/auc",
-        "generated/aggregate_lp/score_sp_abs_gap",
+        "generated/aggregate_lp/eo_abs_gap" if args.fair_score_metric == "eo" else "generated/aggregate_lp/score_sp_abs_gap",
         "fair_controller_delta_final_abs_mean",
         "fair_controller_eta_min",
         "fair_controller_eta_max",

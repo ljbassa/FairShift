@@ -172,3 +172,22 @@ test 쌍의 AUC/SP/EO를 함께 기록합니다. 실행에는 GAE 학습이 포�
 
 `lp/eo_gap`과 `lp/eo_abs_gap`은 모두 절댓값입니다. AUC와 EO를 함께
 비교하고, 동일한 데이터·seed·평가 프로토콜을 사용해야 합니다.
+
+## EO Pareto selection and guidance
+
+To select EO for the existing grid's Pareto plot, add
+`--sp_candidates lp/eo_abs_gap_mean aggregate_lp/eo_abs_gap` and
+`--plot_title "LP Pareto: AUC vs EO"` to the section 3 command, using a separate
+`--out_dir`. This changes the plotted evaluation metric; sampling still applies
+SP guidance. The grid keeps the legacy `selected_sp` / `selected_sp_mean`
+column names, with `selected_sp_key` identifying the EO metric that was selected.
+
+For EO-guided sampling or a learned EO eta/k controller, use the sibling
+[FairWire_feature_fairness_loss instructions](../FairWire_feature_fairness_loss/README.md#sp--eo-controller-selection).
+That folder accepts `--fair_score_metric eo` for controller training and
+`--fair_score_sp --fair_score_metric eo` for static guidance. These flags belong
+to that folder's scripts; this folder's `sample.py` and `fair_grid_eval.py` do
+not implement an EO guidance selector.
+
+Generated graphs, checkpoints, evaluation CSV files, plots, and logs are local
+experiment outputs and are excluded from the code synchronization to FairShift.

@@ -7,6 +7,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from fairness_options import metric_directory, metric_file
+
 
 def str2bool(value):
     if isinstance(value, bool):
@@ -31,8 +34,15 @@ def parse_args():
     parser.add_argument("--repo_dir", type=Path, default=Path.cwd())
     parser.add_argument("--python_exec", default=sys.executable)
     parser.add_argument("--stage1_ckpt", required=True)
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help="Dataset name used for the controller root and Pareto title. Defaults to inferring from --stage1_ckpt.",
+    )
     parser.add_argument("--name_prefix", default="cora_T8_kfixed_controller_grid")
     parser.add_argument("--controller_root", type=Path, default=None)
+    parser.add_argument("--fair_score_metric", choices=["sp", "eo"], default="sp")
+    parser.add_argument("--fair_score_eo_min_mass", type=float, default=1e-6)
     parser.add_argument("--manifest", type=Path, default=None)
 
     # Match EDGE_fairness_loss_after argument names.
@@ -80,9 +90,10 @@ def parse_args():
     parser.add_argument("--pareto_summary_csv", type=Path, default=None)
     parser.add_argument("--pareto_plot_path", type=Path, default=None)
     parser.add_argument("--pareto_front_csv", type=Path, default=None)
-    parser.add_argument("--pareto_x_metric", default="lp/score_sp_abs_gap_mean")
+    parser.add_argument("--pareto_x_metric", default=None)
     parser.add_argument("--pareto_y_metric", default="lp/auc_mean")
     parser.add_argument("--pareto_label_points", choices=["none", "front", "all"], default="front")
+    parser.add_argument("--pareto_title", default=None)
     parser.add_argument(
         "--pareto_extra_summary_csv",
         type=Path,
@@ -105,7 +116,19 @@ def parse_args():
         args.extra_args = args.extra_args[1:]
     if args.fair_score_k_values is None:
         args.fair_score_k_values = [args.fair_score_k]
+    if args.pareto_x_metric is None:
+        args.pareto_x_metric = "lp/eo_abs_gap_mean" if args.fair_score_metric == "eo" else "lp/score_sp_abs_gap_mean"
     return args
+
+
+def infer_dataset_from_stage1_ckpt(stage1_ckpt):
+    ckpt_path = Path(stage1_ckpt)
+    parent = ckpt_path.parent.name
+    if parent.endswith("_cpts"):
+        parts = parent[:-5].split("_")
+        if len(parts) >= 3:
+            return "_".join(parts[:-2])
+    return "cora"
 
 
 def make_run_name(prefix, eta, lr, fair_w, util_w, k_w, fair_score_k, normalize):
@@ -139,6 +162,8 @@ def build_command(args, run_name, eta, lr, fair_w, util_w, k_w, fair_score_k):
         "--num_generation", str(args.num_generation),
         "--fair_label_attr", args.fair_label_attr,
         "--fair_score_eta", str(eta),
+        "--fair_score_metric", args.fair_score_metric,
+        "--fair_score_eo_min_mass", str(args.fair_score_eo_min_mass),
         "--fair_score_k", str(fair_score_k),
         "--fair_score_learn_k", "False",
         "--fair_score_learn_eta", "True",
@@ -148,6 +173,8 @@ def build_command(args, run_name, eta, lr, fair_w, util_w, k_w, fair_score_k):
         "--fair_score_k_tracking_loss_weight", str(k_w),
         "--fair_score_utility_loss_weight", str(util_w),
     ]
+    if args.controller_root is not None:
+        cmd += ["--controller_root", str(args.controller_root)]
     if args.eval_every is not None:
         cmd += ["--eval_every", str(args.eval_every)]
     if args.check_every is not None:
@@ -178,16 +205,19 @@ def resolve_path(path, repo_dir):
     return repo_dir / path
 
 
-def run_generated_pareto(args, repo_dir, controller_root):
+def run_generated_pareto(args, repo_dir, controller_root, dataset):
     summary_csv = resolve_path(args.pareto_summary_csv, repo_dir)
     if summary_csv is None:
         summary_csv = controller_root / f"{args.name_prefix}_summary.csv"
+    summary_csv = metric_file(summary_csv, args.fair_score_metric)
     plot_path = resolve_path(args.pareto_plot_path, repo_dir)
     if plot_path is None:
-        plot_path = controller_root / f"{args.name_prefix}_pareto_lp_auc_vs_score_sp.jpg"
+        plot_path = controller_root / f"{args.name_prefix}_pareto_lp_auc_vs_{args.fair_score_metric}.jpg"
+    plot_path = metric_file(plot_path, args.fair_score_metric)
     front_csv = resolve_path(args.pareto_front_csv, repo_dir)
     if front_csv is None:
         front_csv = plot_path.with_suffix(".front.csv")
+    front_csv = metric_file(front_csv, args.fair_score_metric)
 
     summarize_script = repo_dir / "scripts" / "summarize_controller_grid.py"
     plot_script = repo_dir / "scripts" / "plot_controller_grid_pareto.py"
@@ -196,6 +226,7 @@ def run_generated_pareto(args, repo_dir, controller_root):
         args.python_exec,
         str(summarize_script),
         "--controller_root", str(controller_root),
+        "--fair_score_metric", args.fair_score_metric,
         "--prefix", args.name_prefix,
         "--sort_by", args.pareto_x_metric,
         "--out_csv", str(summary_csv),
@@ -204,12 +235,13 @@ def run_generated_pareto(args, repo_dir, controller_root):
         args.python_exec,
         str(plot_script),
         "--summary_csv", str(summary_csv),
+        "--fair_score_metric", args.fair_score_metric,
         "--out_path", str(plot_path),
         "--front_csv", str(front_csv),
         "--x_metric", args.pareto_x_metric,
         "--y_metric", args.pareto_y_metric,
         "--label_points", args.pareto_label_points,
-        "--title", "cora: Controller LP Pareto",
+        "--title", args.pareto_title or f"{dataset}: Controller LP Pareto",
     ]
     for extra_summary_csv in args.pareto_extra_summary_csv:
         extra_summary_csv = resolve_path(extra_summary_csv, repo_dir)
@@ -219,7 +251,7 @@ def run_generated_pareto(args, repo_dir, controller_root):
     print(" ".join(summary_cmd))
     summary_proc = subprocess.run(summary_cmd, cwd=repo_dir)
     if summary_proc.returncode != 0:
-        return summary_csv, plot_path, summary_proc.returncode
+        return summary_csv, plot_path, front_csv, summary_proc.returncode
 
     print("[grid] generated LP Pareto plot:")
     print(" ".join(plot_cmd))
@@ -230,16 +262,20 @@ def run_generated_pareto(args, repo_dir, controller_root):
 def main():
     args = parse_args()
     repo_dir = args.repo_dir.resolve()
+    dataset = args.dataset or infer_dataset_from_stage1_ckpt(args.stage1_ckpt)
     controller_root = args.controller_root
     if controller_root is None:
-        controller_root = repo_dir / "wandb" / "cora" / "Sync" / "controller"
+        controller_root = resolve_path(Path(args.log_home), repo_dir) / dataset / "Sync" / "controller"
     if not controller_root.is_absolute():
         controller_root = repo_dir / controller_root
+    controller_root = metric_directory(controller_root, args.fair_score_metric)
+    args.controller_root = controller_root
 
     manifest = args.manifest
     if manifest is None:
         manifest = controller_root / f"{args.name_prefix}_manifest.jsonl"
     manifest = resolve_path(manifest, repo_dir)
+    manifest = metric_file(manifest, args.fair_score_metric)
     manifest.parent.mkdir(parents=True, exist_ok=True)
 
     combos = list(itertools.product(
@@ -254,6 +290,7 @@ def main():
         combos = combos[: args.max_runs]
 
     print(f"[grid] repo_dir={repo_dir}")
+    print(f"[grid] dataset={dataset}")
     print(f"[grid] controller_root={controller_root}")
     print(f"[grid] manifest={manifest}")
     print(f"[grid] num_runs={len(combos)}")
@@ -272,6 +309,7 @@ def main():
         final_ckpt = controller_root / run_name / "check" / "controller_final.pt"
         cmd = build_command(args, run_name, eta, lr, fair_w, util_w, k_w, fair_score_k)
         record = {
+            "fair_score_metric": args.fair_score_metric,
             "run_idx": run_idx,
             "num_runs": len(combos),
             "run_name": run_name,
@@ -319,7 +357,7 @@ def main():
             raise SystemExit(proc.returncode)
 
     if args.run_generated_eval and not args.skip_generated_pareto and not args.dry_run:
-        summary_csv, plot_path, front_csv, pareto_returncode = run_generated_pareto(args, repo_dir, controller_root)
+        summary_csv, plot_path, front_csv, pareto_returncode = run_generated_pareto(args, repo_dir, controller_root, dataset)
         if pareto_returncode == 0:
             print(f"[grid] generated LP Pareto summary: {summary_csv}")
             print(f"[grid] generated LP Pareto plot: {plot_path}")
