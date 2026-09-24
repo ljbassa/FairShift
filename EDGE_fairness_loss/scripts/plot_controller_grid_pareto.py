@@ -19,18 +19,24 @@ def parse_args():
     parser.add_argument("--summary_csv", type=Path, required=True)
     parser.add_argument("--out_path", type=Path, default=None)
     parser.add_argument("--front_csv", type=Path, default=None)
-    parser.add_argument("--x_metric", default="lp/score_sp_abs_gap_mean")
+    parser.add_argument("--fair_score_metric", choices=["sp", "eo"], default="sp")
+    parser.add_argument("--x_metric", default=None)
     parser.add_argument("--y_metric", default="lp/auc_mean")
     parser.add_argument("--xerr_metric", default=None)
     parser.add_argument("--yerr_metric", default=None)
-    parser.add_argument("--title", default="Controller LP Pareto: AUC vs score SP gap")
+    parser.add_argument("--title", default=None)
     parser.add_argument("--label_points", choices=["none", "front", "all"], default="front")
     parser.add_argument(
         "--label_fields",
         nargs="+",
         default=["fair_score_k", "fair_score_eta", "fair_weight", "utility_weight"],
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.x_metric is None:
+        args.x_metric = "lp/eo_abs_gap_mean" if args.fair_score_metric == "eo" else "lp/score_sp_abs_gap_mean"
+    if args.title is None:
+        args.title = "Controller LP Pareto: AUC vs EO gap" if args.fair_score_metric == "eo" else "Controller LP Pareto: AUC vs score SP gap"
+    return args
 
 
 def parse_csv_value(value: str) -> Any:
@@ -135,6 +141,8 @@ def write_csv(rows: Iterable[Dict[str, Any]], path: Path) -> None:
 def plot_pareto(args) -> Path:
     summary_csv = args.summary_csv.resolve()
     rows = read_csv_rows(summary_csv)
+    metric = getattr(args, "fair_score_metric", "sp")
+    rows = [row for row in rows if row.get("fair_score_metric", "sp") == metric]
     valid = [
         row
         for row in rows
@@ -162,7 +170,11 @@ def plot_pareto(args) -> Path:
     ]
 
     out_path = args.out_path.resolve() if args.out_path is not None else default_out_path(summary_csv, args.x_metric, args.y_metric)
+    out_base = out_path.parent.parent if out_path.parent.name in {"sp", "eo"} else out_path.parent
+    out_path = out_base / metric / out_path.name
     front_csv = args.front_csv.resolve() if args.front_csv is not None else out_path.with_suffix(".front.csv")
+    front_base = front_csv.parent.parent if front_csv.parent.name in {"sp", "eo"} else front_csv.parent
+    front_csv = front_base / metric / front_csv.name
 
     plt.figure(figsize=(9, 6))
     plt.errorbar(xs, ys, xerr=xerrs, yerr=yerrs, fmt="o", alpha=0.72, capsize=2, markersize=5)

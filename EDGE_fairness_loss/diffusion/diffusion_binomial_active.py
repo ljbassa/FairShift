@@ -1,9 +1,12 @@
+import math
+
 import torch
 import torch.nn.functional as F
 from torch_scatter import scatter
 import torch_geometric as pyg
 from diffusion.diffusion_base import cosine_beta_schedule, log_1_min_a, log_categorical, extract
 from diffusion.diffusion_binomial_vanilla import BinomialDiffusionVanilla
+from diffusion.fairness_surrogate import group_fairness_terms, normalize_fair_score_metric
 """
 Based in part on: https://github.com/lucidrains/denoising-diffusion-pytorch/blob/5989f4c77eafcdc6be0fb4739f0f277a6dd7f7d8/denoising_diffusion_pytorch/denoising_diffusion_pytorch.py#L281
 """
@@ -26,6 +29,7 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                  s_loss_weight=1.0, ratio_loss_weight=0.1, s_pos_weight_cap=50.0,
                  fair_score_eta=0.0, fair_score_k=0.15, fair_score_eta_scale=1.0,
                  fair_label_attr="y",
+                 fair_score_metric="sp", fair_score_eo_min_mass=1e-6,
                  fair_score_controller_train=False, controller_pretrained_ckpt=None,
                  controller_epochs=1000, controller_lr=1e-3,
                  controller_replay_num_samples=1, controller_replay_refresh=100,
@@ -34,6 +38,7 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                  fair_score_k_tracking_loss_weight=1.0,
                  fair_score_utility_loss_weight=1.0,
                  fair_score_guidance_normalize=True,
+                 fair_score_eta_mode="per_step", fair_score_k_mode="per_step",
                  ):
         super(BinomialDiffusionActive, self).__init__(num_node_classes, num_edge_classes, initial_graph_sampler, denoise_fn, timesteps,
                  loss_type, parametrization, final_prob_node, final_prob_edge, sample_time_method, noise_schedule, device)
@@ -47,8 +52,16 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         self.s_pos_weight_cap = s_pos_weight_cap
         self.fair_score_eta = fair_score_eta
         self.fair_score_k = fair_score_k
+        if fair_score_eta_mode not in {"per_step", "shared"}:
+            raise ValueError(f"Unknown eta mode: {fair_score_eta_mode}")
+        if fair_score_k_mode not in {"per_step", "fixed_one"}:
+            raise ValueError(f"Unknown k mode: {fair_score_k_mode}")
+        self.fair_score_eta_mode = fair_score_eta_mode
+        self.fair_score_k_mode = fair_score_k_mode
         self.fair_score_eta_scale = max(float(fair_score_eta_scale), 1e-8)
         self.fair_label_attr = fair_label_attr
+        self.fair_score_metric = normalize_fair_score_metric(fair_score_metric)
+        self.fair_score_eo_min_mass = max(float(fair_score_eo_min_mass), 0.0)
         self.fair_score_controller_train = fair_score_controller_train
         self.controller_pretrained_ckpt = controller_pretrained_ckpt
         self.controller_epochs = controller_epochs
@@ -68,35 +81,34 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             self.register_parameter("fair_score_eta_raw", None)
             return
 
-        raw_k_scalar = torch.logit(torch.tensor(float(self.fair_score_k)).clamp(1e-4, 1.0 - 1e-4))
-
-        raw_k = raw_k_scalar.repeat(self.num_timesteps)
+        if getattr(self, "fair_score_k_mode", "per_step") == "fixed_one":
+            self.register_parameter("fair_score_k_raw", None)
+        else:
+            raw_k_scalar = torch.logit(torch.tensor(float(self.fair_score_k)).clamp(1e-4, 1.0 - 1e-4))
+            self.fair_score_k_raw = torch.nn.Parameter(raw_k_scalar.repeat(self.num_timesteps))
         # In controller mode, fair_score_eta is the base eta value.
-        # fair_score_eta_raw learns a per-step positive multiplier initialized at 1.
+        # A shared eta learns one positive multiplier across every reverse step.
         # fair_score_eta_scale is ignored in controller mode.
-        raw_eta = torch.zeros(self.num_timesteps)
-
-        self.fair_score_k_raw = torch.nn.Parameter(raw_k)
+        eta_size = 1 if getattr(self, "fair_score_eta_mode", "per_step") == "shared" else self.num_timesteps
+        raw_eta = torch.zeros(eta_size)
         self.fair_score_eta_raw = torch.nn.Parameter(raw_eta)
-
-        assert self.fair_score_k_raw.ndim == 1
-        assert self.fair_score_k_raw.numel() == self.num_timesteps
-        assert self.fair_score_eta_raw.ndim == 1
-        assert self.fair_score_eta_raw.numel() == self.num_timesteps
 
     def _get_effective_fair_score_k(self, *args, **kwargs):
         if not self.fair_score_controller_train:
-            return self.fair_score_k
+            return 1.0 if getattr(self, "fair_score_k_mode", "per_step") == "fixed_one" else self.fair_score_k
 
         # Per-step controller convention:
         # t=0 is the final reverse step A^1 -> A^0.
         # t=self.num_timesteps-1 is the first reverse step A^T -> A^{T-1}.
-        effective_k_all = torch.sigmoid(self.fair_score_k_raw)
+        if getattr(self, "fair_score_k_mode", "per_step") == "fixed_one":
+            effective_k_all = self.fair_score_eta_raw.new_ones(self.num_timesteps)
+        else:
+            effective_k_all = torch.sigmoid(self.fair_score_k_raw)
         t_graph = kwargs.get("t_graph", None)
         if t_graph is None:
             return effective_k_all
 
-        t_index = torch.as_tensor(t_graph, device=self.fair_score_k_raw.device, dtype=torch.long)
+        t_index = torch.as_tensor(t_graph, device=effective_k_all.device, dtype=torch.long)
         t_index = t_index.clamp(0, self.num_timesteps - 1)
         return effective_k_all.index_select(0, t_index.reshape(-1)).reshape(t_index.shape)
 
@@ -114,6 +126,8 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         )
         denom = F.softplus(torch.zeros((), device=self.fair_score_eta_raw.device, dtype=self.fair_score_eta_raw.dtype))
         effective_eta_all = base_eta * F.softplus(self.fair_score_eta_raw) / denom
+        if getattr(self, "fair_score_eta_mode", "per_step") == "shared":
+            effective_eta_all = effective_eta_all.expand(self.num_timesteps)
         t_graph = kwargs.get("t_graph", None)
         if t_graph is None:
             return effective_eta_all
@@ -183,6 +197,8 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         rho_edge = rho_graph[self._fair_edge_batch]
         self._fair_score_h = torch.logit(rho_edge)
         self._fair_score_q = rho_edge.clone()
+        self._fair_condition_h = self._fair_score_h.clone()
+        self._fair_condition_w = self._fair_score_q.clone()
         self._fair_score_R1 = scatter(
             self._fair_score_q * self._fair_edge_sensitive_mask.float(),
             self._fair_edge_batch,
@@ -197,6 +213,34 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             dim_size=num_graphs,
             reduce='sum',
         )
+        self._fair_condition_C1 = scatter(
+            self._fair_condition_w * self._fair_edge_sensitive_mask.float(),
+            self._fair_edge_batch,
+            dim=0,
+            dim_size=num_graphs,
+            reduce='sum',
+        )
+        self._fair_condition_C0 = scatter(
+            self._fair_condition_w * (~self._fair_edge_sensitive_mask).float(),
+            self._fair_edge_batch,
+            dim=0,
+            dim_size=num_graphs,
+            reduce='sum',
+        )
+        self._fair_score_U1 = scatter(
+            self._fair_condition_w * self._fair_score_q * self._fair_edge_sensitive_mask.float(),
+            self._fair_edge_batch,
+            dim=0,
+            dim_size=num_graphs,
+            reduce='sum',
+        )
+        self._fair_score_U0 = scatter(
+            self._fair_condition_w * self._fair_score_q * (~self._fair_edge_sensitive_mask).float(),
+            self._fair_edge_batch,
+            dim=0,
+            dim_size=num_graphs,
+            reduce='sum',
+        )
 
     def _build_controller_replay_header(self, batched_graph):
         return {
@@ -204,8 +248,14 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             "initial_log_full_edge_attr_t": batched_graph.log_full_edge_attr_t.detach().clone(),
             "h_init": self._fair_score_h.detach().clone(),
             "q_init": self._fair_score_q.detach().clone(),
+            "condition_h_init": self._fair_condition_h.detach().clone(),
+            "condition_w_init": self._fair_condition_w.detach().clone(),
             "R1_init": self._fair_score_R1.detach().clone(),
             "R0_init": self._fair_score_R0.detach().clone(),
+            "C1_init": self._fair_condition_C1.detach().clone(),
+            "C0_init": self._fair_condition_C0.detach().clone(),
+            "U1_init": self._fair_score_U1.detach().clone(),
+            "U0_init": self._fair_score_U0.detach().clone(),
             "N1": self._fair_N1.detach().clone(),
             "N0": self._fair_N0.detach().clone(),
             "full_mask": self._fair_edge_sensitive_mask.detach().clone(),
@@ -241,12 +291,35 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         device = self.device
         self._fair_score_h = replay["h_init"].to(device=device).clone()
         self._fair_score_q = replay["q_init"].to(device=device).clone()
+        self._fair_condition_h = replay.get("condition_h_init", replay["h_init"]).to(device=device).clone()
+        self._fair_condition_w = replay.get("condition_w_init", replay["q_init"]).to(device=device).clone()
         self._fair_score_R1 = replay["R1_init"].to(device=device).clone()
         self._fair_score_R0 = replay["R0_init"].to(device=device).clone()
+        self._fair_condition_C1 = replay.get("C1_init", replay["R1_init"]).to(device=device).clone()
+        self._fair_condition_C0 = replay.get("C0_init", replay["R0_init"]).to(device=device).clone()
         self._fair_N1 = replay["N1"].to(device=device).clone()
         self._fair_N0 = replay["N0"].to(device=device).clone()
         self._fair_edge_sensitive_mask = replay["full_mask"].to(device=device, dtype=torch.bool).clone()
         self._fair_edge_batch = replay["full_batch"].to(device=device, dtype=torch.long).clone()
+        if "U1_init" in replay and "U0_init" in replay:
+            self._fair_score_U1 = replay["U1_init"].to(device=device).clone()
+            self._fair_score_U0 = replay["U0_init"].to(device=device).clone()
+        else:
+            # Compatibility with SP replay files recorded before EO support.
+            self._fair_score_U1 = scatter(
+                self._fair_condition_w * self._fair_score_q * self._fair_edge_sensitive_mask.float(),
+                self._fair_edge_batch,
+                dim=0,
+                dim_size=int(replay["num_graphs"]),
+                reduce='sum',
+            )
+            self._fair_score_U0 = scatter(
+                self._fair_condition_w * self._fair_score_q * (~self._fair_edge_sensitive_mask).float(),
+                self._fair_edge_batch,
+                dim=0,
+                dim_size=int(replay["num_graphs"]),
+                reduce='sum',
+            )
 
     def _log_sample_categorical_with_optional_gumbel(self, logits, num_classes, gumbel_noise=None):
         if gumbel_noise is None:
@@ -267,8 +340,13 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         self,
         z_active,
         h_active,
+        condition_h_active,
         R1,
         R0,
+        C1,
+        C0,
+        U1,
+        U0,
         N1,
         N0,
         batch_active,
@@ -284,6 +362,11 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         q_prev = torch.sigmoid(h_active)
         q_pre = torch.sigmoid(h_pre)
         delta_q_pre = q_pre - q_prev
+        condition_h_pre = condition_h_active + k_active.detach() * (
+            z_active.detach() - condition_h_active
+        )
+        w_prev = torch.sigmoid(condition_h_active).detach()
+        w_pre = torch.sigmoid(condition_h_pre).detach()
 
         dR1 = scatter(
             delta_q_pre * mask_float,
@@ -301,15 +384,71 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         )
         R1_pre = R1 + dR1
         R0_pre = R0 + dR0
+        delta_w_pre = w_pre - w_prev
+        dC1 = scatter(
+            delta_w_pre * mask_float,
+            batch_active,
+            dim=0,
+            dim_size=num_graphs,
+            reduce='sum',
+        )
+        dC0 = scatter(
+            delta_w_pre * inv_mask_float,
+            batch_active,
+            dim=0,
+            dim_size=num_graphs,
+            reduce='sum',
+        )
+        C1_pre = C1 + dC1
+        C0_pre = C0 + dC0
+        delta_u_pre = w_pre * q_pre - w_prev * q_prev
+        dU1 = scatter(
+            delta_u_pre * mask_float,
+            batch_active,
+            dim=0,
+            dim_size=num_graphs,
+            reduce='sum',
+        )
+        dU0 = scatter(
+            delta_u_pre * inv_mask_float,
+            batch_active,
+            dim=0,
+            dim_size=num_graphs,
+            reduce='sum',
+        )
+        U1_pre = U1 + dU1
+        U0_pre = U0 + dU0
 
-        safe_N1 = torch.where(N1 > 0, N1, torch.ones_like(N1))
-        safe_N0 = torch.where(N0 > 0, N0, torch.ones_like(N0))
-        delta_pre = R1_pre / safe_N1 - R0_pre / safe_N0
-
-        a_e = mask_float / safe_N1[batch_active] - inv_mask_float / safe_N0[batch_active]
+        fairness = group_fairness_terms(
+            self.fair_score_metric,
+            R1_pre,
+            R0_pre,
+            C1_pre,
+            C0_pre,
+            U1_pre,
+            U0_pre,
+            N1,
+            N0,
+            q_active=q_pre,
+            positive_weight_active=w_pre,
+            batch_active=batch_active,
+            same_active=mask_active,
+            min_positive_mass=self.fair_score_eo_min_mass,
+        )
+        delta_pre = fairness["gap"]
+        a_e = fairness["derivative"]
+        valid_guidance = fairness["valid_graph"]
+        if self.fair_score_metric == "sp":
+            # Preserve the original SP formula, including its empty-group behavior.
+            safe_N1 = torch.where(N1 > 0, N1, torch.ones_like(N1))
+            safe_N0 = torch.where(N0 > 0, N0, torch.ones_like(N0))
+            delta_pre = R1_pre / safe_N1 - R0_pre / safe_N0
+            a_e = mask_float / safe_N1[batch_active] - inv_mask_float / safe_N0[batch_active]
 
         if not self.fair_score_guidance_normalize:
-            step_scale_graph = 0.5 * (N1 + N0)
+            step_scale_graph = 0.5 * (
+                fairness["support_same"] + fairness["support_diff"]
+            )
             step_scale_active = step_scale_graph.index_select(0, batch_active)
             a_bar = step_scale_active * a_e
             grad_raw = (
@@ -319,7 +458,6 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                 * q_pre
                 * (1.0 - q_pre)
             )
-            valid_guidance = (N1 > 0) & (N0 > 0)
             grad_raw = torch.where(
                 valid_guidance.index_select(0, batch_active),
                 grad_raw,
@@ -333,11 +471,24 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                 "h_pre": h_pre.detach(),
                 "q_prev": q_prev.detach(),
                 "q_pre": q_pre.detach(),
+                "condition_h_pre": condition_h_pre.detach(),
+                "w_prev": w_prev.detach(),
+                "w_pre": w_pre.detach(),
                 "delta_q_pre": delta_q_pre.detach(),
                 "R1_pre": R1_pre.detach(),
                 "R0_pre": R0_pre.detach(),
+                "C1_pre": C1_pre.detach(),
+                "C0_pre": C0_pre.detach(),
+                "U1_pre": U1_pre.detach(),
+                "U0_pre": U0_pre.detach(),
                 "delta_pre": delta_pre.detach(),
                 "a_e": a_e.detach(),
+                "valid_graph": valid_guidance.detach(),
+                "invalid_graph_fraction": (~valid_guidance).float().mean().detach(),
+                "same_rate": fairness["same_rate"].detach(),
+                "diff_rate": fairness["diff_rate"].detach(),
+                "support_same": fairness["support_same"].detach(),
+                "support_diff": fairness["support_diff"].detach(),
                 "a_bar": a_bar.detach(),
                 "step_scale_active": step_scale_active.detach(),
                 "grad_raw": grad_raw.detach(),
@@ -351,6 +502,12 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             return grad.detach(), aux
 
         grad_raw = delta_pre.index_select(0, batch_active) * a_e * k_active * q_pre * (1.0 - q_pre)
+        if self.fair_score_metric == "eo":
+            grad_raw = torch.where(
+                valid_guidance.index_select(0, batch_active),
+                grad_raw,
+                torch.zeros_like(grad_raw),
+            )
         zero = grad_raw.sum() * 0.0
         grad = grad_raw
         grad_scale = torch.ones_like(grad)
@@ -406,11 +563,24 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             "h_pre": h_pre.detach(),
             "q_prev": q_prev.detach(),
             "q_pre": q_pre.detach(),
+            "condition_h_pre": condition_h_pre.detach(),
+            "w_prev": w_prev.detach(),
+            "w_pre": w_pre.detach(),
             "delta_q_pre": delta_q_pre.detach(),
             "R1_pre": R1_pre.detach(),
             "R0_pre": R0_pre.detach(),
+            "C1_pre": C1_pre.detach(),
+            "C0_pre": C0_pre.detach(),
+            "U1_pre": U1_pre.detach(),
+            "U0_pre": U0_pre.detach(),
             "delta_pre": delta_pre.detach(),
             "a_e": a_e.detach(),
+            "valid_graph": valid_guidance.detach(),
+            "invalid_graph_fraction": (~valid_guidance).float().mean().detach(),
+            "same_rate": fairness["same_rate"].detach(),
+            "diff_rate": fairness["diff_rate"].detach(),
+            "support_same": fairness["support_same"].detach(),
+            "support_diff": fairness["support_diff"].detach(),
             "grad_raw": grad_raw.detach(),
             "grad_scale": grad_scale.detach(),
             "grad_raw_abs_mean": grad_raw_abs_mean,
@@ -430,11 +600,37 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         h = replay["h_init"].to(device)
         dtype = h.dtype
         q = torch.sigmoid(h)
+        condition_h = replay.get("condition_h_init", replay["h_init"]).to(
+            device=device, dtype=dtype
+        )
+        condition_w = torch.sigmoid(condition_h).detach()
         R1 = replay["R1_init"].to(device=device, dtype=dtype)
         R0 = replay["R0_init"].to(device=device, dtype=dtype)
+        C1 = replay.get("C1_init", replay["R1_init"]).to(device=device, dtype=dtype)
+        C0 = replay.get("C0_init", replay["R0_init"]).to(device=device, dtype=dtype)
         N1 = replay["N1"].to(device=device, dtype=dtype)
         N0 = replay["N0"].to(device=device, dtype=dtype)
         num_graphs = int(replay.get("num_graphs", R1.size(0)))
+        if "U1_init" in replay and "U0_init" in replay:
+            U1 = replay["U1_init"].to(device=device, dtype=dtype)
+            U0 = replay["U0_init"].to(device=device, dtype=dtype)
+        else:
+            full_mask = replay["full_mask"].to(device=device, dtype=torch.bool)
+            full_batch = replay["full_batch"].to(device=device, dtype=torch.long)
+            U1 = scatter(
+                condition_w * q * full_mask.float(),
+                full_batch,
+                dim=0,
+                dim_size=num_graphs,
+                reduce='sum',
+            )
+            U0 = scatter(
+                condition_w * q * (~full_mask).float(),
+                full_batch,
+                dim=0,
+                dim_size=num_graphs,
+                reduce='sum',
+            )
 
         k_all = self._get_effective_fair_score_k().to(device=device, dtype=dtype)
         eta_all = self._get_effective_fair_score_eta().to(device=device, dtype=dtype)
@@ -473,12 +669,18 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             k_active = k_graph.index_select(0, batch_active)
             eta_active = eta_graph.index_select(0, batch_active)
             h_active = h.index_select(0, idx_active)
+            condition_h_active = condition_h.index_select(0, idx_active)
 
             grad_dir, guidance_diagnostics = self._compute_fair_controller_guidance(
                 z_active=z_raw,
                 h_active=h_active,
+                condition_h_active=condition_h_active,
                 R1=R1,
                 R0=R0,
+                C1=C1,
+                C0=C0,
+                U1=U1,
+                U0=U0,
                 N1=N1,
                 N0=N0,
                 batch_active=batch_active,
@@ -515,9 +717,44 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                 dim_size=num_graphs,
                 reduce='sum',
             )
+            condition_h_new = guidance_diagnostics["condition_h_pre"]
+            w_prev = guidance_diagnostics["w_prev"]
+            w_new = guidance_diagnostics["w_pre"]
+            delta_w = w_new - w_prev
+            C1 = C1 + scatter(
+                delta_w * mask_active.float(),
+                batch_active,
+                dim=0,
+                dim_size=num_graphs,
+                reduce='sum',
+            )
+            C0 = C0 + scatter(
+                delta_w * (~mask_active).float(),
+                batch_active,
+                dim=0,
+                dim_size=num_graphs,
+                reduce='sum',
+            )
+            delta_u = w_new * q_new_fair - w_prev * q_prev
+            U1 = U1 + scatter(
+                delta_u * mask_active.float(),
+                batch_active,
+                dim=0,
+                dim_size=num_graphs,
+                reduce='sum',
+            )
+            U0 = U0 + scatter(
+                delta_u * (~mask_active).float(),
+                batch_active,
+                dim=0,
+                dim_size=num_graphs,
+                reduce='sum',
+            )
 
             h = h.index_copy(0, idx_active, h_new_fair)
             q = q.index_copy(0, idx_active, q_new_fair)
+            condition_h = condition_h.index_copy(0, idx_active, condition_h_new)
+            condition_w = condition_w.index_copy(0, idx_active, w_new)
 
             # Preserve the Stage-1 link probability for the k-controller:
             # BCEWithLogits(h_track, sigmoid(z_raw)) is minimized when h_track == z_raw.
@@ -546,10 +783,20 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             mean_abs_shift_sum = mean_abs_shift_sum + shift_abs.sum()
             mean_abs_shift_count += int(idx_active.numel())
 
-        safe_N1 = torch.where(N1 > 0, N1, torch.ones_like(N1))
-        safe_N0 = torch.where(N0 > 0, N0, torch.ones_like(N0))
-        delta_final = R1 / safe_N1 - R0 / safe_N0
-        valid_graph = (N1 > 0) & (N0 > 0)
+        final_fairness = group_fairness_terms(
+            self.fair_score_metric,
+            R1,
+            R0,
+            C1,
+            C0,
+            U1,
+            U0,
+            N1,
+            N0,
+            min_positive_mass=self.fair_score_eo_min_mass,
+        )
+        delta_final = final_fairness["gap"]
+        valid_graph = final_fairness["valid_graph"]
         if valid_graph.any():
             fair_loss = 0.5 * delta_final[valid_graph].pow(2).mean()
             delta_final_abs_mean = delta_final[valid_graph].abs().mean()
@@ -597,10 +844,15 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         k_schedule = k_all.detach().reshape(-1)
         eta_schedule = eta_all.detach().reshape(-1)
         stats = {
+            "fair_score_metric": self.fair_score_metric,
             "fair_controller_fair_loss": float(fair_loss.detach().cpu()),
             "fair_controller_k_tracking_loss": float(k_tracking_loss.detach().cpu()),
             "fair_controller_utility_loss": float(utility_loss.detach().cpu()),
             "fair_controller_delta_final_abs_mean": float(delta_final_abs_mean.detach().cpu()),
+            "fair_controller_gap_final_abs_mean": float(delta_final_abs_mean.detach().cpu()),
+            "fair_controller_valid_graphs": int(valid_graph.sum().detach().cpu()),
+            "fair_controller_total_graphs": int(valid_graph.numel()),
+            "fair_controller_invalid_graph_fraction": float((~valid_graph).float().mean().detach().cpu()),
             "fair_controller_k_t0": float(k_schedule[t0].cpu()),
             "fair_controller_k_tmid": float(k_schedule[tmid].cpu()),
             "fair_controller_k_tlast": float(k_schedule[tlast].cpu()),
@@ -620,25 +872,19 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             "fair_guidance_eta_mean": float(fair_guidance_eta_mean.detach().cpu()),
             "fair_guidance_k_mean": float(fair_guidance_k_mean.detach().cpu()),
         }
+        if self.fair_score_metric == "eo":
+            stats.update({
+                "fair_controller_eo_positive_mass_same_min": float(C1.detach().min().cpu()),
+                "fair_controller_eo_positive_mass_same_mean": float(C1.detach().mean().cpu()),
+                "fair_controller_eo_positive_mass_diff_min": float(C0.detach().min().cpu()),
+                "fair_controller_eo_positive_mass_diff_mean": float(C0.detach().mean().cpu()),
+            })
         return loss, stats
 
     def freeze_for_fair_controller_training(self):
         if not self.fair_score_controller_train:
             raise ValueError("fair_score_controller_train must be True for fair controller training.")
-        if self.fair_score_k_raw is None:
-            raise ValueError("fair_score_k_raw must not be None for fair controller training.")
-        if self.fair_score_eta_raw is None:
-            raise ValueError("fair_score_eta_raw must not be None for fair controller training.")
-        if tuple(self.fair_score_k_raw.shape) != (self.num_timesteps,):
-            raise ValueError(
-                f"fair_score_k_raw must have shape [{self.num_timesteps}], "
-                f"got {tuple(self.fair_score_k_raw.shape)}."
-            )
-        if tuple(self.fair_score_eta_raw.shape) != (self.num_timesteps,):
-            raise ValueError(
-                f"fair_score_eta_raw must have shape [{self.num_timesteps}], "
-                f"got {tuple(self.fair_score_eta_raw.shape)}."
-            )
+        self._validate_fair_controller_shapes()
 
         for param in self.parameters():
             param.requires_grad = False
@@ -650,23 +896,34 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                 param.requires_grad = True
                 controller_params.append(param)
 
-        if len(controller_params) != 2:
-            raise ValueError(
-                f"Expected exactly two trainable fair-score controller parameters, got {len(controller_params)}."
-            )
-
         self.train()
         self._denoise_fn.eval()
-        print(f"[controller] trainable fair_score_k_raw shape: {tuple(self.fair_score_k_raw.shape)}")
-        print(f"[controller] trainable fair_score_eta_raw shape: {tuple(self.fair_score_eta_raw.shape)}")
+        for name in ("fair_score_k_raw", "fair_score_eta_raw"):
+            param = getattr(self, name)
+            print(f"[controller] {name}: {'fixed (no parameter)' if param is None else tuple(param.shape)}")
         return controller_params
 
+    def _validate_fair_controller_shapes(self):
+        k_mode = getattr(self, "fair_score_k_mode", "per_step")
+        eta_mode = getattr(self, "fair_score_eta_mode", "per_step")
+        expected = {
+            "fair_score_k_raw": None if k_mode == "fixed_one" else (self.num_timesteps,),
+            "fair_score_eta_raw": (1,) if eta_mode == "shared" else (self.num_timesteps,),
+        }
+        for name, shape in expected.items():
+            param = getattr(self, name, None)
+            actual = None if param is None else tuple(param.shape)
+            if actual != shape:
+                raise ValueError(f"{name} must have shape {shape}, got {actual}.")
+
     def get_fair_controller_state_dict(self):
-        assert self.fair_score_k_raw is None or self.fair_score_k_raw.numel() == self.num_timesteps
-        assert self.fair_score_eta_raw is None or self.fair_score_eta_raw.numel() == self.num_timesteps
+        if self.fair_score_controller_train:
+            self._validate_fair_controller_shapes()
         state = {
-            "fair_score_k_mode": "per_step_sigmoid",
-            "fair_score_eta_mode": "per_step_multiplier_softplus",
+            "fair_score_metric": self.fair_score_metric,
+            "fair_score_eo_min_mass": self.fair_score_eo_min_mass,
+            "fair_score_k_mode": "fixed_one" if getattr(self, "fair_score_k_mode", "per_step") == "fixed_one" else "per_step_sigmoid",
+            "fair_score_eta_mode": "shared_multiplier_softplus" if getattr(self, "fair_score_eta_mode", "per_step") == "shared" else "per_step_multiplier_softplus",
             "fair_score_eta_base": self.fair_score_eta,
             "fair_score_eta_scale": self.fair_score_eta_scale,
             "num_timesteps": self.num_timesteps,
@@ -679,10 +936,28 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
     def load_fair_controller_state_dict(self, state_dict, strict=True):
         if "controller" in state_dict:
             state_dict = state_dict["controller"]
+        mode_aliases = {
+            "per_step_sigmoid": "per_step",
+            "per_step_multiplier_softplus": "per_step",
+            "shared_multiplier_softplus": "shared",
+        }
+        for key in ("fair_score_k_mode", "fair_score_eta_mode"):
+            saved = state_dict.get(key, "per_step")
+            saved = mode_aliases.get(saved, saved)
+            current = getattr(self, key, "per_step")
+            if strict and saved != current:
+                raise ValueError(f"Controller mode mismatch for {key}: checkpoint={saved}, model={current}.")
+        self.fair_score_metric = normalize_fair_score_metric(state_dict.get("fair_score_metric", "sp"))
+        self.fair_score_eo_min_mass = max(float(state_dict.get("fair_score_eo_min_mass", 1e-6)), 0.0)
+        if "fair_score_eta_base" in state_dict:
+            self.fair_score_eta = float(state_dict["fair_score_eta_base"])
         missing = []
         for name in ("fair_score_k_raw", "fair_score_eta_raw"):
             value = state_dict.get(name, None)
             param = getattr(self, name, None)
+            if (name == "fair_score_k_raw" and value is None and param is None
+                    and getattr(self, "fair_score_k_mode", "per_step") == "fixed_one"):
+                continue
             if value is None:
                 missing.append(name)
                 if strict:
@@ -816,6 +1091,113 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             f"sampling_stage={self.sampling_stage!r} is a reserved skeleton and has no implementation yet."
         )
          
+    def _observe_proxy_pre_guidance(self, batched_graph, observer, metadata, diagnostics=None):
+        """Send detached CPU copies of the actual pre-shift full-pair cache.
+
+        The committed score cache contains guided history. Only the current
+        active entries are replaced in the *copy* by the candidate used by the
+        production guidance calculation. EO's condition cache follows separate
+        unshifted logits. Nothing is committed, resampled, or replayed here.
+        """
+        def cpu_copy(value):
+            return value.detach().to(device="cpu", copy=True)
+
+        active = cpu_copy(batched_graph.active_edge_indices)
+        q = cpu_copy(self._fair_score_q)
+        if diagnostics is not None:
+            q[active] = cpu_copy(diagnostics["q_pre"])
+            production_proxy = diagnostics["delta_pre"]
+            terms = diagnostics
+        else:
+            # No active pairs at this stage: the production cache is unchanged.
+            terms = group_fairness_terms(
+                self.fair_score_metric,
+                self._fair_score_R1, self._fair_score_R0,
+                self._fair_condition_C1, self._fair_condition_C0,
+                self._fair_score_U1, self._fair_score_U0,
+                self._fair_N1, self._fair_N0,
+                min_positive_mass=self.fair_score_eo_min_mass,
+            )
+            production_proxy = terms["gap"]
+            if self.fair_score_metric == "sp":
+                # Match production SP's original empty-group behavior too.
+                n1 = torch.where(self._fair_N1 > 0, self._fair_N1, torch.ones_like(self._fair_N1))
+                n0 = torch.where(self._fair_N0 > 0, self._fair_N0, torch.ones_like(self._fair_N0))
+                production_proxy = self._fair_score_R1 / n1 - self._fair_score_R0 / n0
+
+        valid = cpu_copy(terms["valid_graph"])
+        raw_proxy = cpu_copy(production_proxy)
+        record = dict(metadata)
+        record.update({
+            "target": self.fair_score_metric,
+            "metric": self.fair_score_metric,
+            "pair_ids": cpu_copy(batched_graph.full_edge_index),
+            "same_mask": cpu_copy(self._fair_edge_sensitive_mask),
+            "pair_batch": cpu_copy(self._fair_edge_batch),
+            "active_pair_indices": active,
+            "q": q,
+            "production_proxy": raw_proxy,
+            "proxy_gap": torch.where(valid, raw_proxy, torch.full_like(raw_proxy, float("nan"))),
+            "valid_graph": valid,
+            "support_same": cpu_copy(terms["support_same"]),
+            "support_diff": cpu_copy(terms["support_diff"]),
+            "guidance_applied": diagnostics is not None,
+        })
+        if self.fair_score_metric == "eo":
+            w = cpu_copy(self._fair_condition_w)
+            if diagnostics is not None:
+                w[active] = cpu_copy(diagnostics["w_pre"])
+            record["w"] = w
+        observer(record)
+
+    def _observe_direct_gap_cache(self, batched_graph, observer, metadata,
+                                  visit_count, diagnostics=None):
+        """Copy one exact full-cache event without changing the trajectory.
+
+        At a pre event only the current active entries in the *copy* receive
+        the provisional q_bar/w_bar. At the terminal post event all entries
+        come from the committed caches. Thus inactive and never-visited pairs
+        retain their actual cached values (including the initial prior).
+        """
+        def cpu_copy(value):
+            return value.detach().to(device="cpu", copy=True)
+
+        active = cpu_copy(batched_graph.active_edge_indices)
+        q = cpu_copy(self._fair_score_q)
+        if diagnostics is not None:
+            q[active] = cpu_copy(diagnostics["q_pre"])
+        visits = cpu_copy(visit_count)
+        record = dict(metadata)
+        record.update({
+            "schema_version": 1,
+            "metric": self.fair_score_metric,
+            "target": self.fair_score_metric,
+            "score_unit": "probability",
+            "pair_ids": cpu_copy(batched_graph.full_edge_index),
+            "pair_batch": cpu_copy(self._fair_edge_batch),
+            "node_batch": cpu_copy(batched_graph.batch),
+            "nodes_per_graph": cpu_copy(batched_graph.nodes_per_graph),
+            "pair_id_convention": "global_node_indices_unordered_i_lt_j",
+            "same_mask": cpu_copy(self._fair_edge_sensitive_mask),
+            "active_pair_indices": active,
+            "q": q,
+            "visit_count": visits,
+            "visited_mask": visits > 0,
+            "visit_count_definition": "completed guided commits before this event",
+            "guidance_applied": bool(active.numel()),
+            "group_label_attr": self.fair_label_attr,
+            # p_sample commits all active entries once. Denoiser internals may
+            # batch computation but never commit partial fairness-cache state.
+            "chunk_index": 0,
+            "chunks_per_step": 1,
+        })
+        if self.fair_score_metric == "eo":
+            w = cpu_copy(self._fair_condition_w)
+            if diagnostics is not None:
+                w[active] = cpu_copy(diagnostics["w_pre"])
+            record["w"] = w
+        observer(record)
+
     @torch.no_grad()
     def p_sample(
         self,
@@ -828,6 +1210,11 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         undirected: bool = True,
         record_controller_replay: bool = False,
         controller_replay_step=None,
+        proxy_observer=None,
+        proxy_observer_metadata=None,
+        direct_gap_observer=None,
+        direct_gap_observer_metadata=None,
+        direct_gap_visit_count=None,
     ):
         """
         diffusion_active 전용 p_sample.
@@ -844,6 +1231,14 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             or getattr(self, "_fair_guidance_active", False)
         )
         apply_fair_guidance = bool(getattr(self, "_fair_guidance_active", False))
+        if proxy_observer is not None and (
+            not apply_fair_guidance or record_controller_replay or playback_controller_replay
+        ):
+            raise ValueError("proxy_observer requires the actual guided trajectory without replay")
+        if direct_gap_observer is not None and (
+            not apply_fair_guidance or record_controller_replay or playback_controller_replay
+        ):
+            raise ValueError("direct_gap_observer requires the actual guided trajectory without replay")
         if fair_state_needed and not hasattr(self, "_fair_edge_batch"):
             self._init_score_sp_state_if_needed(batched_graph)
 
@@ -906,6 +1301,15 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
 
         # 2) active edge가 없으면: 상태 유지 + empty trace 반환
         if batched_graph.active_edge_indices.numel() == 0:
+            if proxy_observer is not None:
+                self._observe_proxy_pre_guidance(
+                    batched_graph, proxy_observer, proxy_observer_metadata or {},
+                )
+            if direct_gap_observer is not None:
+                self._observe_direct_gap_cache(
+                    batched_graph, direct_gap_observer, direct_gap_observer_metadata or {},
+                    direct_gap_visit_count,
+                )
             if playback_controller_replay and "log_node_attr_tmin1" in controller_replay_step:
                 log_node_empty = controller_replay_step["log_node_attr_tmin1"].to(
                     device=batched_graph.log_node_attr_t.device,
@@ -984,6 +1388,7 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             mask_active = self._fair_edge_sensitive_mask.index_select(0, idx_active)
             h_prev = self._fair_score_h.index_select(0, idx_active)
             q_prev = torch.sigmoid(h_prev)
+            condition_h_prev = self._fair_condition_h.index_select(0, idx_active)
 
             k_graph = torch.as_tensor(
                 self._get_effective_fair_score_k(t_graph=t_graph),
@@ -1013,14 +1418,29 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             grad_dir, guidance_diagnostics = self._compute_fair_controller_guidance(
                 z_active=z_raw,
                 h_active=h_prev,
+                condition_h_active=condition_h_prev,
                 R1=self._fair_score_R1,
                 R0=self._fair_score_R0,
+                C1=self._fair_condition_C1,
+                C0=self._fair_condition_C0,
+                U1=self._fair_score_U1,
+                U0=self._fair_score_U0,
                 N1=self._fair_N1,
                 N0=self._fair_N0,
                 batch_active=batch_active,
                 mask_active=mask_active,
                 k_active=k_active,
             )
+            if proxy_observer is not None:
+                self._observe_proxy_pre_guidance(
+                    batched_graph, proxy_observer, proxy_observer_metadata or {},
+                    diagnostics=guidance_diagnostics,
+                )
+            if direct_gap_observer is not None:
+                self._observe_direct_gap_cache(
+                    batched_graph, direct_gap_observer, direct_gap_observer_metadata or {},
+                    direct_gap_visit_count, diagnostics=guidance_diagnostics,
+                )
             z_final = z_raw - eta_active * grad_dir
             shift_abs = (eta_active * grad_dir).detach().abs()
             shift_abs_mean = shift_abs.mean() if shift_abs.numel() > 0 else z_raw.new_tensor(0.0)
@@ -1051,7 +1471,43 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                 dim_size=batched_graph.num_graphs,
                 reduce='sum',
             )
+            condition_h_new = guidance_diagnostics["condition_h_pre"]
+            w_prev = guidance_diagnostics["w_prev"]
+            w_new = guidance_diagnostics["w_pre"]
+            self._fair_condition_h[idx_active] = condition_h_new
+            self._fair_condition_w[idx_active] = w_new
+            delta_w_new = w_new - w_prev
+            self._fair_condition_C1 += scatter(
+                delta_w_new * mask_active.float(),
+                batch_active,
+                dim=0,
+                dim_size=batched_graph.num_graphs,
+                reduce='sum',
+            )
+            self._fair_condition_C0 += scatter(
+                delta_w_new * (~mask_active).float(),
+                batch_active,
+                dim=0,
+                dim_size=batched_graph.num_graphs,
+                reduce='sum',
+            )
+            delta_u_new = w_new * q_new - w_prev * q_prev
+            self._fair_score_U1 += scatter(
+                delta_u_new * mask_active.float(),
+                batch_active,
+                dim=0,
+                dim_size=batched_graph.num_graphs,
+                reduce='sum',
+            )
+            self._fair_score_U0 += scatter(
+                delta_u_new * (~mask_active).float(),
+                batch_active,
+                dim=0,
+                dim_size=batched_graph.num_graphs,
+                reduce='sum',
+            )
             stage_trace.update({
+                "fair_score_metric": self.fair_score_metric,
                 "fair_guidance_grad_dir": grad_dir.detach(),
                 "fair_guidance_delta_pre": guidance_diagnostics["delta_pre"],
                 "fair_guidance_grad_scale": guidance_diagnostics["grad_scale"],
@@ -1060,7 +1516,16 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                 "fair_guidance_delta_pre_abs_mean": guidance_diagnostics["delta_pre"].detach().abs().mean(),
                 "fair_guidance_eta_mean": eta_active.detach().mean(),
                 "fair_guidance_k_mean": k_active.detach().mean(),
+                "fair_guidance_invalid_graph_fraction": guidance_diagnostics["invalid_graph_fraction"],
+                "fair_guidance_support_same": guidance_diagnostics["support_same"],
+                "fair_guidance_support_diff": guidance_diagnostics["support_diff"],
             })
+            if hasattr(self, "_fair_guidance_diagnostic_records"):
+                self._fair_guidance_diagnostic_records.append({
+                    "invalid_graph_fraction": guidance_diagnostics["invalid_graph_fraction"].detach(),
+                    "support_same": guidance_diagnostics["support_same"].detach(),
+                    "support_diff": guidance_diagnostics["support_diff"].detach(),
+                })
 
         # 5) 샘플링해서 x_{t-1} 생성 (active edge만)
         if playback_controller_replay:
@@ -1411,7 +1876,48 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             delta_as_sparse_adj=False,
             undirected=True,
             return_controller_replay: bool = False,
-            controller_replay=None):
+            controller_replay=None,
+            proxy_observer=None,
+            proxy_observer_progress=(0.25, 0.50, 0.90),
+            direct_gap_observer=None,
+            direct_gap_progress=(0.25, 0.50, 0.90)):
+        """Sample normally, optionally observing selected pre-guidance stages.
+
+        A fraction p selects reverse-loop index ceil(p*T)-1 (zero based).
+        Callbacks receive independent CPU tensors and do not alter the return
+        value. The observer is unavailable for unguided or replay sampling.
+        direct_gap_observer additionally receives q_final after the last guided
+        commit, even when the final active set is empty. Its optional pre events
+        and mandatory final post event are distinct immutable full-U snapshots.
+        """
+        observer_steps = {}
+        if proxy_observer is not None:
+            if not callable(proxy_observer):
+                raise TypeError("proxy_observer must be callable")
+            if return_controller_replay or controller_replay is not None or not self.fair_score_controller_train:
+                raise ValueError("proxy_observer requires the actual guided trajectory without replay")
+            for progress in proxy_observer_progress:
+                progress = float(progress)
+                if not math.isfinite(progress) or not 0 < progress <= 1:
+                    raise ValueError("proxy observer progress must be finite and in (0, 1]")
+                loop_index = math.ceil(progress * self.num_timesteps) - 1
+                if loop_index in observer_steps:
+                    raise ValueError("proxy observer fractions must select distinct reverse-loop steps")
+                observer_steps[loop_index] = progress
+        direct_gap_steps = {}
+        if direct_gap_observer is not None:
+            if not callable(direct_gap_observer):
+                raise TypeError("direct_gap_observer must be callable")
+            if return_controller_replay or controller_replay is not None or not self.fair_score_controller_train:
+                raise ValueError("direct_gap_observer requires the actual guided trajectory without replay")
+            for progress in direct_gap_progress:
+                progress = float(progress)
+                if not math.isfinite(progress) or not 0 < progress <= 1:
+                    raise ValueError("direct gap progress must be finite and in (0, 1]")
+                loop_index = math.ceil(progress * self.num_timesteps) - 1
+                if loop_index in direct_gap_steps:
+                    raise ValueError("direct gap fractions must select distinct reverse-loop steps")
+                direct_gap_steps[loop_index] = progress
         if return_controller_replay and controller_replay is not None:
             raise ValueError("return_controller_replay and controller_replay playback cannot be used together")
         playback_controller_replay = controller_replay is not None
@@ -1453,6 +1959,7 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             self._init_score_sp_state_if_needed(batched_graph)
             self._fair_guidance_sample_shift_abs_sum = torch.zeros((), device=self.device)
             self._fair_guidance_sample_shift_abs_count = 0
+            self._fair_guidance_diagnostic_records = []
             if playback_controller_replay:
                 self._restore_controller_replay_fair_state(playback_replay)
         if return_controller_replay:
@@ -1466,8 +1973,44 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                 )
 
         edge_deltas = [] if return_edge_deltas else None
+        direct_gap_visit_count = None
+        if direct_gap_observer is not None:
+            direct_gap_visit_count = torch.zeros(
+                batched_graph.full_edge_index.size(1), dtype=torch.long, device="cpu",
+            )
 
         for replay_i, t in enumerate(reversed(range(0, self.num_timesteps))):
+            observer_kwargs = {}
+            if replay_i in observer_steps:
+                observer_kwargs = {
+                    "proxy_observer": proxy_observer,
+                    "proxy_observer_metadata": {
+                        "requested_progress": observer_steps[replay_i],
+                        "loop_index": replay_i,
+                        "step_number": replay_i + 1,
+                        "diffusion_t": int(t),
+                        "total_steps": self.num_timesteps,
+                        "progress": (replay_i + 1) / self.num_timesteps,
+                    },
+                }
+            if replay_i in direct_gap_steps:
+                observer_kwargs.update({
+                    "direct_gap_observer": direct_gap_observer,
+                    "direct_gap_visit_count": direct_gap_visit_count,
+                    "direct_gap_observer_metadata": {
+                        "phase": "pre",
+                        "score_name": "q_bar",
+                        "requested_progress": direct_gap_steps[replay_i],
+                        "loop_index": replay_i,
+                        "step_number": replay_i + 1,
+                        "diffusion_t": int(t),
+                        "reverse_t": int(t),
+                        "total_steps": self.num_timesteps,
+                        "progress": (replay_i + 1) / self.num_timesteps,
+                        "event_id": 2 * replay_i,
+                        "event": "pre_guidance_provisional_cache",
+                    },
+                })
             t_node = torch.full((num_nodes,), t, device=self.device, dtype=torch.long)
             t_edge = torch.full((num_edges,), t, device=self.device, dtype=torch.long)
             replay_step = replay_steps[replay_i] if playback_controller_replay else None
@@ -1487,6 +2030,7 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                     keep_zeros=keep_zeros,
                     record_controller_replay=return_controller_replay,
                     controller_replay_step=replay_step,
+                    **observer_kwargs,
                 )
                 controller_step = trace.pop("controller_replay_step", None)
                 if return_controller_replay and controller_step is not None:
@@ -1512,6 +2056,7 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                     keep_zeros=keep_zeros,
                     record_controller_replay=return_controller_replay,
                     controller_replay_step=replay_step,
+                    **observer_kwargs,
                 )
                 if return_controller_replay:
                     controller_step = trace.pop("controller_replay_step", None)
@@ -1520,6 +2065,27 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
 
             batched_graph.log_full_edge_attr_t = log_full_edge_attr_tmin1
             batched_graph.log_node_attr_t = log_node_attr_tmin1
+            if direct_gap_observer is not None:
+                # Count the real active commit; no extra sampling or forward.
+                active_cpu = batched_graph.active_edge_indices.detach().to(device="cpu")
+                direct_gap_visit_count[active_cpu] += 1
+
+        if direct_gap_observer is not None:
+            self._observe_direct_gap_cache(
+                batched_graph, direct_gap_observer, {
+                    "phase": "post",
+                    "score_name": "q_final",
+                    "requested_progress": 1.0,
+                    "loop_index": self.num_timesteps - 1,
+                    "step_number": self.num_timesteps,
+                    "diffusion_t": 0,
+                    "reverse_t": 0,
+                    "total_steps": self.num_timesteps,
+                    "progress": 1.0,
+                    "event_id": 2 * self.num_timesteps - 1,
+                    "event": "after_final_guided_commit",
+                }, direct_gap_visit_count,
+            )
 
         # 아래는 원래 DiffusionBase.sample() 후처리 그대로 (edge_index 생성 등)
         edge_attr = batched_graph.log_full_edge_attr_t.argmax(-1)
@@ -1543,6 +2109,51 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                 mean_abs_shift = torch.zeros((), device=self.device)
             self._last_fair_guidance_mean_abs_shift = float(mean_abs_shift.detach().cpu())
             print(f"[fair guidance] mean_abs_shift={self._last_fair_guidance_mean_abs_shift:.8g}")
+            records = getattr(self, "_fair_guidance_diagnostic_records", [])
+            if records:
+                invalid = torch.stack([record["invalid_graph_fraction"] for record in records])
+                same_support = torch.cat([record["support_same"].reshape(-1) for record in records])
+                diff_support = torch.cat([record["support_diff"].reshape(-1) for record in records])
+                self._last_fair_guidance_diagnostics = {
+                    "metric": self.fair_score_metric,
+                    "num_guided_steps": len(records),
+                    "invalid_graph_fraction_mean": float(invalid.mean().cpu()),
+                    "invalid_graph_fraction_max": float(invalid.max().cpu()),
+                    "support_same_min": float(same_support.min().cpu()),
+                    "support_same_mean": float(same_support.mean().cpu()),
+                    "support_diff_min": float(diff_support.min().cpu()),
+                    "support_diff_mean": float(diff_support.mean().cpu()),
+                }
+                if self.fair_score_metric == "eo":
+                    self._last_fair_guidance_diagnostics.update({
+                        "eo_positive_mass_same_min": float(same_support.min().cpu()),
+                        "eo_positive_mass_same_mean": float(same_support.mean().cpu()),
+                        "eo_positive_mass_diff_min": float(diff_support.min().cpu()),
+                        "eo_positive_mass_diff_mean": float(diff_support.mean().cpu()),
+                    })
+            else:
+                self._last_fair_guidance_diagnostics = {
+                    "metric": self.fair_score_metric,
+                    "num_guided_steps": 0,
+                    "invalid_graph_fraction_mean": 0.0,
+                    "invalid_graph_fraction_max": 0.0,
+                    "support_same_min": 0.0,
+                    "support_same_mean": 0.0,
+                    "support_diff_min": 0.0,
+                    "support_diff_mean": 0.0,
+                }
+                if self.fair_score_metric == "eo":
+                    self._last_fair_guidance_diagnostics.update({
+                        "eo_positive_mass_same_min": 0.0,
+                        "eo_positive_mass_same_mean": 0.0,
+                        "eo_positive_mass_diff_min": 0.0,
+                        "eo_positive_mass_diff_mean": 0.0,
+                    })
+
+        if return_soft and self.fair_score_metric == "eo" and self._fair_guidance_active and hasattr(self, "_fair_score_q"):
+            batched_graph.full_edge_score_prob = self._fair_score_q.detach().clone()
+            batched_graph.full_edge_score_logit = self._fair_score_h.detach().clone()
+            batched_graph.full_edge_condition_prob = self._fair_condition_w.detach().clone()
 
         if return_edge_deltas:
             if return_controller_replay:

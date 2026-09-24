@@ -33,11 +33,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--k_values', type=float, nargs='+', required=True)
     p.add_argument('--seeds', type=int, nargs='+', required=True)
     p.add_argument('--out_dir', type=str, default='fair_grid_results_multiseed')
+    p.add_argument('--fair_score_metric', choices=['sp', 'eo'], default=None)
+    p.add_argument('--fair_score_eo_min_mass', type=float, default=None)
     p.add_argument('--pair_mode', action='store_true', help='Use zip(eta_values, k_values) instead of full Cartesian product')
     p.add_argument('--include_baseline', action='store_true', help='Also add one extra baseline point with eta=0 and baseline_k')
     p.add_argument('--baseline_k', type=float, default=1.0, help='k value used for the extra baseline point when --include_baseline is set')
     p.add_argument('--fail_fast', action='store_true', help='Stop immediately if one subprocess call fails')
-    p.add_argument('--plot_x_metric', type=str, default='value/fair_edge_sp_abs_gap', help='Metric to minimize on x-axis')
+    p.add_argument('--plot_x_metric', type=str, default=None, help='Metric to minimize on x-axis')
     p.add_argument('--plot_y_metric', type=str, default='value/linkpred_auc', help='Metric to maximize on y-axis')
     p.add_argument('--label_points', choices=['none', 'front', 'all'], default='front')
     p.add_argument('--plot_title', type=str, default='Pareto curve: fairness gap vs AUC')
@@ -51,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     args = p.parse_args()
     if args.eval_args and args.eval_args[0] == '--':
         args.eval_args = args.eval_args[1:]
+    args.fair_score_metric = args.fair_score_metric or extract_flag_value(args.eval_args, '--fair_score_metric') or 'sp'
+    if args.fair_score_metric not in ('sp', 'eo'):
+        p.error('--fair_score_metric must be sp or eo')
+    if args.plot_x_metric is None:
+        args.plot_x_metric = ('value/fair_edge_score_eo_abs_gap' if args.fair_score_metric == 'eo'
+                              else 'value/fair_edge_sp_abs_gap')
     return args
 
 
@@ -362,7 +370,7 @@ def main():
     if not (repo_dir / 'evaluate.py').exists():
         raise FileNotFoundError(f'evaluate.py not found in repo_dir: {repo_dir}')
 
-    out_dir = Path(args.out_dir).resolve()
+    out_dir = Path(args.out_dir).resolve() / args.fair_score_metric
     out_dir.mkdir(parents=True, exist_ok=True)
 
     base_eval_args = prepare_base_eval_args(args.eval_args)
@@ -391,7 +399,10 @@ def main():
                 '--seed', str(seed),
                 '--fair_score_eta', str(eta),
                 '--fair_score_k', str(k),
+                '--fair_score_metric', args.fair_score_metric,
             ]
+            if args.fair_score_eo_min_mass is not None:
+                cmd += ['--fair_score_eo_min_mass', str(args.fair_score_eo_min_mass)]
 
             print(f'[{run_idx}/{total_runs}] seed={seed}, eta={eta}, k={k}')
             proc = subprocess.run(
@@ -403,6 +414,7 @@ def main():
             )
 
             row = {
+                'fair_score_metric': args.fair_score_metric,
                 'eta': eta,
                 'k': k,
                 'seed': seed,

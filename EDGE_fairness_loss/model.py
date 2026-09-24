@@ -54,8 +54,33 @@ def add_model_args(parser):
     parser.add_argument('--ratio_loss_weight', type=float, default=0.1)
     parser.add_argument('--s_pos_weight_cap', type=float, default=50.0)
     parser.add_argument('--fair_label_attr', type=str, default='y', help='node label attr used by fairness evaluation utilities')
+    parser.add_argument(
+        '--fair_score_metric',
+        type=str,
+        choices=['sp', 'eo'],
+        default='sp',
+        help='reverse-probability fairness surrogate used by the Stage-2 controller',
+    )
+    parser.add_argument(
+        '--fair_score_eo_min_mass',
+        type=float,
+        default=1e-6,
+        help='minimum soft-positive mass required in both pair groups for EO guidance',
+    )
     parser.add_argument('--fair_score_eta', type=float, default=0.0)
     parser.add_argument('--fair_score_k', type=float, default=0.15)
+    parser.add_argument(
+        '--fair_score_eta_mode',
+        choices=['per_step', 'shared'],
+        default='per_step',
+        help='learn one eta per diffusion step or one shared eta for all steps',
+    )
+    parser.add_argument(
+        '--fair_score_k_mode',
+        choices=['per_step', 'fixed_one'],
+        default='per_step',
+        help='learn a sigmoid-constrained k per step or fix k exactly to 1',
+    )
     parser.add_argument('--fair_score_eta_scale', type=float, default=1.0)
     parser.add_argument('--fair_score_train_loss_weight', type=float, default=1.0, help='legacy controller loss weight; kept for checkpoint/CLI compatibility')
     parser.add_argument('--fair_score_controller_train', action='store_true')
@@ -148,8 +173,12 @@ def get_model(args, initial_graph_sampler):
         s_pos_weight_cap=args.s_pos_weight_cap,
         fair_score_eta=getattr(args, 'fair_score_eta', 0.0),
         fair_score_k=getattr(args, 'fair_score_k', 0.15),
+        fair_score_eta_mode=getattr(args, 'fair_score_eta_mode', 'per_step'),
+        fair_score_k_mode=getattr(args, 'fair_score_k_mode', 'per_step'),
         fair_score_eta_scale=getattr(args, 'fair_score_eta_scale', 1.0),
         fair_label_attr=getattr(args, 'fair_label_attr', 'y'),
+        fair_score_metric=getattr(args, 'fair_score_metric', 'sp'),
+        fair_score_eo_min_mass=getattr(args, 'fair_score_eo_min_mass', 1e-6),
         fair_score_controller_train=getattr(args, 'fair_score_controller_train', False),
         controller_pretrained_ckpt=getattr(args, 'controller_pretrained_ckpt', None),
         controller_epochs=getattr(args, 'controller_epochs', 1000),

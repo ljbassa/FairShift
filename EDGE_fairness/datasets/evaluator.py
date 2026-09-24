@@ -119,6 +119,41 @@ def compute_edge_score_sp_stats_from_components(
         'fair_edge_score_sp_abs_gap': abs(gap) if np.isfinite(gap) else np.nan,
     }
 
+def compute_edge_score_eo_stats_from_components(
+    full_edge_index, edge_scores, positive_weights, node_labels,
+    kept_nodes=None, min_positive_mass=1e-6,
+):
+    """Soft-positive EO surrogate; held-out LP EO is evaluated separately."""
+    if any(value is None for value in (full_edge_index, edge_scores, positive_weights, node_labels)):
+        return None
+
+    def array(value):
+        return value.detach().cpu().numpy() if hasattr(value, 'detach') else np.asarray(value)
+
+    edges = array(full_edge_index).astype(np.int64)
+    scores = array(edge_scores).astype(np.float64).reshape(-1)
+    weights = array(positive_weights).astype(np.float64).reshape(-1)
+    labels = array(node_labels).reshape(-1)
+    if edges.ndim != 2 or edges.shape[0] != 2 or edges.shape[1] != scores.size or scores.size != weights.size:
+        raise ValueError('edge indices, scores, and positive weights must describe the same edges')
+    same = labels[edges[0]] == labels[edges[1]]
+    keep = np.ones(scores.size, dtype=bool)
+    if kept_nodes is not None:
+        keep = np.isin(edges[0], list(kept_nodes)) & np.isin(edges[1], list(kept_nodes))
+    rates = []
+    for group in (same & keep, ~same & keep):
+        mass = weights[group].sum()
+        rates.append(float((weights[group] * scores[group]).sum() / mass)
+                     if group.any() and mass > min_positive_mass else np.nan)
+    gap = rates[0] - rates[1]
+    return {
+        'fair_edge_score_eo_same_rate': rates[0],
+        'fair_edge_score_eo_diff_rate': rates[1],
+        'fair_edge_score_eo_gap': gap,
+        'fair_edge_score_eo_abs_gap': abs(gap),
+    }
+
+
 class NetworkEvaluator:
     def __init__(
         self,

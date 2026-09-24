@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import math
+import warnings
 from pathlib import Path
 
 import torch
@@ -15,22 +16,43 @@ def parse_args():
         type=Path,
         default=Path("wandb/cora/multinomial_diffusion/controller"),
     )
+    parser.add_argument("--fair_score_metric", choices=["sp", "eo"], default="sp")
     parser.add_argument("--prefix", required=True)
     parser.add_argument("--out_csv", type=Path, default=None)
-    parser.add_argument("--sort_by", default="eval/value/fair_edge_sp_abs_gap")
+    parser.add_argument("--sort_by", default=None)
     parser.add_argument("--descending", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.sort_by is None:
+        args.sort_by = "lp/eo_abs_gap_mean" if args.fair_score_metric == "eo" else "eval/value/fair_edge_sp_abs_gap"
+    return args
 
 
 def read_jsonl_last(path):
+    """Return the last metrics object, warning about damaged log records."""
     if not path.exists():
         return {}
     last = {}
     with path.open("r", encoding="utf-8") as fp:
-        for line in fp:
+        for line_number, line in enumerate(fp, start=1):
             line = line.strip()
-            if line:
-                last = json.loads(line)
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                warnings.warn(
+                    f"{path}:{line_number}: skipping invalid JSON record ({exc})",
+                    RuntimeWarning,
+                )
+                continue
+            if not isinstance(record, dict):
+                warnings.warn(
+                    f"{path}:{line_number}: skipping non-object JSON record "
+                    f"({type(record).__name__})",
+                    RuntimeWarning,
+                )
+                continue
+            last = record
     return last
 
 
@@ -95,6 +117,10 @@ def weighted_terms(row, args):
 def main():
     args = parse_args()
     root = args.controller_root
+    if root.name in {"sp", "eo"}:
+        root = root.parent / args.fair_score_metric
+    elif args.fair_score_metric == "eo" or (root / args.fair_score_metric).is_dir():
+        root = root / args.fair_score_metric
     rows = []
 
     for run_dir in sorted(root.glob(f"{args.prefix}*")):
@@ -102,6 +128,9 @@ def main():
             continue
         metrics = read_jsonl_last(run_dir / "controller_metrics.jsonl")
         ckpt_args = load_args_from_checkpoint(run_dir)
+        run_metric = ckpt_args.get("fair_score_metric", metrics.get("fair_score_metric", "sp"))
+        if run_metric != args.fair_score_metric:
+            continue
         lp_summary_path = find_lp_summary(run_dir)
         lp_summary = read_csv_first(lp_summary_path) if lp_summary_path else {}
 
@@ -112,6 +141,7 @@ def main():
             "loss": metrics.get("loss"),
             "fair_score_k": ckpt_args.get("fair_score_k"),
             "fair_score_eta": ckpt_args.get("fair_score_eta"),
+            "fair_score_metric": run_metric,
             "controller_lr": ckpt_args.get("controller_lr"),
             "fair_weight": ckpt_args.get("fair_score_fair_loss_weight"),
             "k_tracking_weight": ckpt_args.get("fair_score_k_tracking_loss_weight"),
@@ -125,6 +155,13 @@ def main():
             "fair_controller_k_tracking_loss",
             "fair_controller_utility_loss",
             "fair_controller_delta_final_abs_mean",
+            "fair_controller_gap_final_abs_mean",
+            "fair_controller_valid_graphs",
+            "fair_controller_total_graphs",
+            "fair_controller_eo_positive_mass_same_min",
+            "fair_controller_eo_positive_mass_same_mean",
+            "fair_controller_eo_positive_mass_diff_min",
+            "fair_controller_eo_positive_mass_diff_mean",
             "fair_controller_mean_abs_shift",
             "fair_guidance_raw_abs_mean",
             "fair_guidance_shift_abs_mean",
@@ -158,9 +195,18 @@ def main():
             "lp/score_sp_abs_gap_mean",
             "lp/score_sp_abs_gap_std",
             "lp/sp_abs_gap_mean",
+            "lp/eo_gap_mean",
+            "lp/eo_gap_std",
+            "lp/eo_abs_gap_mean",
+            "lp/eo_abs_gap_std",
+            "lp/eo_defined_mean",
+            "lp/eo_num_pos_sensitive_mean",
+            "lp/eo_num_pos_nonsensitive_mean",
             "aggregate_lp/auc",
             "aggregate_lp/score_sp_abs_gap",
             "aggregate_lp/sp_abs_gap",
+            "aggregate_lp/eo_gap",
+            "aggregate_lp/eo_abs_gap",
             "aggregate_value/linkpred_auc",
         ]
         for key in lp_keep:
@@ -177,12 +223,14 @@ def main():
     rows.sort(
         key=lambda row: (
             math.inf if not isinstance(row.get(sort_key), (int, float)) else row.get(sort_key),
-            row.get("loss", math.inf),
+            math.inf if not isinstance(row.get("loss"), (int, float)) else row["loss"],
         ),
         reverse=args.descending,
     )
 
     out_csv = args.out_csv or (root / f"{args.prefix}_summary.csv")
+    out_base = out_csv.parent.parent if out_csv.parent.name in {"sp", "eo"} else out_csv.parent
+    out_csv = out_base / args.fair_score_metric / out_csv.name
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = []
     seen = set()
@@ -203,13 +251,29 @@ def main():
         "loss",
         "fair_score_k",
         "eval/value/linkpred_auc",
-        "eval/value/fair_edge_sp_abs_gap",
+    ]
+    if args.fair_score_metric == "sp":
+        preview_keys.append("eval/value/fair_edge_sp_abs_gap")
+    preview_keys += [
         "lp/auc_mean",
         "lp/auc_std",
-        "lp/score_sp_gap_mean",
-        "lp/score_sp_gap_std",
-        "generated/aggregate_lp/auc",
-        "generated/aggregate_lp/score_sp_abs_gap",
+    ]
+    if args.fair_score_metric == "eo":
+        preview_keys += [
+            "lp/eo_abs_gap_mean",
+            "lp/eo_abs_gap_std",
+            "lp/eo_defined_mean",
+            "generated/aggregate_lp/auc",
+            "generated/aggregate_lp/eo_abs_gap",
+        ]
+    else:
+        preview_keys += [
+            "lp/score_sp_gap_mean",
+            "lp/score_sp_gap_std",
+            "generated/aggregate_lp/auc",
+            "generated/aggregate_lp/score_sp_abs_gap",
+        ]
+    preview_keys += [
         "fair_controller_eta_min",
         "fair_controller_eta_max",
         "fair_controller_mean_abs_shift",

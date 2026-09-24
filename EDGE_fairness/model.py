@@ -32,6 +32,8 @@ def add_model_args(parser):
     parser.add_argument('--ratio_loss_weight', type=float, default=0.1)
     parser.add_argument('--s_pos_weight_cap', type=float, default=50.0)
     parser.add_argument('--fair_score_sp', action='store_true')
+    parser.add_argument('--fair_score_metric', choices=['sp', 'eo'], default='sp')
+    parser.add_argument('--fair_score_eo_min_mass', type=float, default=1e-6)
     parser.add_argument('--fair_score_eta', type=float, default=0.0)
     parser.add_argument('--fair_score_k', type=float, default=0.15)
     parser.add_argument('--fair_score_apply_sample', type=eval, default=True)
@@ -111,6 +113,8 @@ def get_model(args, initial_graph_sampler):
         ratio_loss_weight=args.ratio_loss_weight,
         s_pos_weight_cap=args.s_pos_weight_cap,
         fair_score_sp=getattr(args, 'fair_score_sp', False),
+        fair_score_metric=getattr(args, 'fair_score_metric', 'sp'),
+        fair_score_eo_min_mass=getattr(args, 'fair_score_eo_min_mass', 1e-6),
         fair_score_eta=getattr(args, 'fair_score_eta', 0.0),
         fair_score_k=getattr(args, 'fair_score_k', 0.15),
         fair_score_apply_sample=getattr(args, 'fair_score_apply_sample', True),

@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "asset_root": "..",
+  "device": "cuda:0",
+  "evaluator_protocol": "existing_samplepy_grid_v1",
+  "sign_threshold": 1e-06,
+  "progress": [
+    0.25,
+    0.5,
+    0.9,
+    1.0
+  ],
+  "configurations": [
+    {
+      "id": "cora_sp_fixed_k_T",
+      "dataset": "cora",
+      "target": "sp",
+      "backbone_checkpoint": "../EDGE_fairness/wandb/cora/checkpoint_4999.pt",
+      "backbone_args": "../EDGE_fairness/wandb/cora/stage1_fixed_eval_4999/args.pickle",
+      "graph": "../EDGE_fairness/graphs/cora_feat.pkl",
+      "group_attr": "y",
+      "controller": {
+        "kind": "T",
+        "checkpoint": null,
+        "mapping_status": "unresolved: existing pilot learns k; do not substitute it"
+      },
+      "runs": [
+        {
+          "graph_seed": 941001,
+          "split_seed": 1941001,
+          "evaluator_seeds": [
+            2941001
+          ]
+        }
+      ]
+    }
+  ]
+}

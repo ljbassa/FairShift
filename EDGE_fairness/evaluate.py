@@ -16,6 +16,7 @@ from diffusion.utils import add_parent_path
 add_parent_path(level=1)
 from datasets.data import get_data
 from datasets.evaluator import compute_edge_score_sp_stats_from_components
+from datasets.evaluator import compute_edge_score_eo_stats_from_components
 
 # Model
 from model import get_model
@@ -201,6 +202,8 @@ def build_parser():
         help='also materialize diffusion edge-delta traces; off by default because evaluation does not use them',
     )
     parser.add_argument('--fair_score_sp', action='store_true')
+    parser.add_argument('--fair_score_metric', choices=['sp', 'eo'], default=None)
+    parser.add_argument('--fair_score_eo_min_mass', type=float, default=None)
     parser.add_argument('--fair_score_eta', type=float, default=None)
     parser.add_argument('--fair_score_k', type=float, default=None)
     parser.add_argument('--fair_score_apply_sample', type=eval, default=None)
@@ -250,6 +253,10 @@ def run_evaluate(eval_args):
     args.fair_label_attr = resolve_fair_label_attr(eval_args, args)
     if eval_args.fair_score_sp:
         args.fair_score_sp = True
+    for key in ('fair_score_metric', 'fair_score_eo_min_mass'):
+        value = getattr(eval_args, key, None)
+        if value is not None:
+            setattr(args, key, value)
     if eval_args.fair_score_eta is not None:
         args.fair_score_eta = eval_args.fair_score_eta
     if eval_args.fair_score_k is not None:
@@ -296,6 +303,8 @@ def run_evaluate(eval_args):
     saved_deltas = []
     if eval_args.save_samples:
         save_root = Path(eval_args.save_dir) if eval_args.save_dir is not None else Path(log_dir) / 'generated_samples'
+        if getattr(args, 'fair_score_sp', False) or getattr(args, 'fair_score_metric', 'sp') == 'eo':
+            save_root = save_root / getattr(args, 'fair_score_metric', 'sp')
         save_root.mkdir(parents=True, exist_ok=True)
 
     # Sample in micro-batches to reduce peak GPU memory.
@@ -324,6 +333,7 @@ def run_evaluate(eval_args):
         sampled_pygraph = sampled_pygraph.cpu()
         pyg_datas = sampled_pygraph.to_data_list()
         batch_full_edge_score_prob = getattr(sampled_pygraph, 'full_edge_score_prob', None)
+        batch_positive_weights = getattr(sampled_pygraph, 'full_edge_positive_weight', None)
         if batch_full_edge_score_prob is not None:
             batch_full_edge_score_prob = batch_full_edge_score_prob.cpu()
             edge_offsets = [0]
@@ -355,6 +365,14 @@ def run_evaluate(eval_args):
                     kept_nodes=kept_nodes,
                 )
                 if soft_fair_stats is not None:
+                    if batch_positive_weights is not None:
+                        soft_fair_stats.update(compute_edge_score_eo_stats_from_components(
+                            full_edge_index=pyg_data.full_edge_index,
+                            edge_scores=batch_full_edge_score_prob[edge_start:edge_end],
+                            positive_weights=batch_positive_weights[edge_start:edge_end],
+                            node_labels=node_labels, kept_nodes=kept_nodes,
+                            min_positive_mass=getattr(args, 'fair_score_eo_min_mass', 1e-6),
+                        ))
                     generated_soft_fair_stats.append(soft_fair_stats)
 
             if store_generated_graphs:
@@ -435,6 +453,8 @@ def run_evaluate(eval_args):
             'largest_cc': bool(eval_args.largest_cc),
             'return_edge_deltas': bool(eval_args.return_edge_deltas),
             'fair_score_sp': bool(getattr(args, 'fair_score_sp', False)),
+            'fair_score_metric': getattr(args, 'fair_score_metric', 'sp'),
+            'fair_score_eo_min_mass': getattr(args, 'fair_score_eo_min_mass', 1e-6),
             'fair_score_eta': getattr(args, 'fair_score_eta', None),
             'fair_score_k': getattr(args, 'fair_score_k', None),
             'fair_score_apply_sample': getattr(args, 'fair_score_apply_sample', None),

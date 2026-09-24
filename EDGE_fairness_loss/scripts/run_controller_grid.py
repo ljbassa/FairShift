@@ -43,6 +43,8 @@ def parse_args():
     parser.add_argument("--controller_replay_num_samples", type=int, default=2)
     parser.add_argument("--controller_replay_refresh", type=int, default=10)
     parser.add_argument("--fair_score_k", type=float, default=0.5)
+    parser.add_argument("--fair_score_metric", choices=["sp", "eo"], default="sp")
+    parser.add_argument("--fair_score_eo_min_mass", type=float, default=1e-6)
     parser.add_argument(
         "--fair_score_k_values",
         type=float,
@@ -75,12 +77,17 @@ def parse_args():
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--fail_fast", action="store_true")
     parser.add_argument("--max_runs", type=int, default=None)
+    parser.add_argument("--include_uncontrolled", action="store_true",
+                        help="export a separate Stage-1 baseline with controller training/guidance disabled")
+    parser.add_argument("--generation_seed", type=int, default=None,
+                        help="reset RNG before final graph export for every run, including uncontrolled")
     parser.add_argument(
         "--run_generated_eval",
         action="store_true",
         help="after each successful controller run, run evaluate_generated_graphs.py on controller_best.pyg_full.pt",
     )
     parser.add_argument("--generated_eval_device", default=None)
+    parser.add_argument("--generated_eval_seed", type=int, default=0)
     parser.add_argument("--generated_eval_label_attr", default="y")
     parser.add_argument("--generated_eval_sensitive_attr", default="y")
     parser.add_argument("--force_generated_eval", action="store_true")
@@ -91,7 +98,7 @@ def parse_args():
     )
     parser.add_argument("--pareto_summary_csv", type=Path, default=None)
     parser.add_argument("--pareto_plot_path", type=Path, default=None)
-    parser.add_argument("--pareto_x_metric", default="lp/score_sp_abs_gap_mean")
+    parser.add_argument("--pareto_x_metric", default=None)
     parser.add_argument("--pareto_y_metric", default="lp/auc_mean")
     parser.add_argument("--pareto_label_points", choices=["none", "front", "all"], default="front")
     parser.add_argument(
@@ -104,6 +111,8 @@ def parse_args():
         args.extra_args = args.extra_args[1:]
     if args.fair_score_k_values is None:
         args.fair_score_k_values = [args.fair_score_k]
+    if args.pareto_x_metric is None:
+        args.pareto_x_metric = "lp/eo_abs_gap_mean" if args.fair_score_metric == "eo" else "lp/score_sp_abs_gap_mean"
     return args
 
 
@@ -147,6 +156,8 @@ def build_command(args, run_name, eta, lr, fair_w, util_w, k_w, fair_score_k):
         "--num_heads", *[str(x) for x in args.num_heads],
         "--use_node_feat",
         "--fair_score_k", str(fair_score_k),
+        "--fair_score_metric", args.fair_score_metric,
+        "--fair_score_eo_min_mass", str(args.fair_score_eo_min_mass),
         "--fair_score_eta", str(eta),
         "--fair_score_fair_loss_weight", str(fair_w),
         "--fair_score_k_tracking_loss_weight", str(k_w),
@@ -157,8 +168,12 @@ def build_command(args, run_name, eta, lr, fair_w, util_w, k_w, fair_score_k):
         "--eval_every", str(args.eval_every),
         "--check_every", str(args.check_every),
     ]
+    if args.controller_root is not None:
+        cmd += ["--controller_root", str(args.controller_root)]
     if args.clip_value is not None:
         cmd += ["--clip_value", str(args.clip_value)]
+    if args.generation_seed is not None:
+        cmd += ["--generation_seed", str(args.generation_seed)]
     cmd += args.extra_args
     return cmd
 
@@ -169,8 +184,8 @@ def run_generated_eval(args, repo_dir, controller_root, run_name):
     per_graph_path = graph_path.with_name(f"{graph_path.name[:-3]}.overlap_lp_gae_per_graph.csv")
 
     if not graph_path.exists():
-        print(f"[grid] generated graph not found; skipping LP eval: {graph_path}")
-        return None, None
+        print(f"[grid] generated graph not found; LP eval failed: {graph_path}")
+        return None, 1
     if summary_path.exists() and not args.force_generated_eval:
         print(f"[grid] LP summary exists; skipping LP eval: {summary_path}")
         return summary_path, 0
@@ -184,6 +199,7 @@ def run_generated_eval(args, repo_dir, controller_root, run_name):
         "--label_attr", args.generated_eval_label_attr,
         "--sensitive_attr", args.generated_eval_sensitive_attr,
         "--device", eval_device,
+        "--seed", str(args.generated_eval_seed),
         "--out_summary_csv", str(summary_path),
         "--out_per_graph_csv", str(per_graph_path),
     ]
@@ -191,6 +207,38 @@ def run_generated_eval(args, repo_dir, controller_root, run_name):
     print(" ".join(cmd))
     proc = subprocess.run(cmd, cwd=repo_dir)
     return summary_path, proc.returncode
+
+
+def run_uncontrolled(args, repo_dir, controller_root):
+    # Keep the baseline outside the controller prefix so grid summaries cannot
+    # accidentally treat it as a trained candidate.
+    run_name = f"uncontrolled_{args.name_prefix}"
+    generated_dir = controller_root / run_name / "generated_samples"
+    graph_path = generated_dir / "controller_best.pyg_full.pt"
+    meta_path = generated_dir / "controller_best.meta.json"
+    cmd = build_command(args, run_name, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+    cmd.append("--uncontrolled")
+    print("[grid] uncontrolled Stage-1 baseline:")
+    print(" ".join(cmd))
+    if args.dry_run:
+        return None, 0
+    if args.skip_existing and graph_path.exists() and meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        checkpoint_path = resolve_optional_path(Path(meta["checkpoint_path"]), repo_dir).resolve()
+        expected_checkpoint = resolve_optional_path(Path(args.stage1_ckpt), repo_dir).resolve()
+        if (not meta.get("uncontrolled") or meta.get("fairness_sampling_enabled") is not False
+                or meta.get("generation_seed") != args.generation_seed
+                or meta.get("num_graphs") != args.num_generation
+                or checkpoint_path != expected_checkpoint):
+            raise ValueError(f"Existing uncontrolled metadata does not match this run: {meta_path}")
+        print(f"[grid] reuse uncontrolled graphs: {graph_path}")
+    else:
+        proc = subprocess.run(cmd, cwd=repo_dir)
+        if proc.returncode:
+            return None, proc.returncode
+    if args.run_generated_eval:
+        return run_generated_eval(args, repo_dir, controller_root, run_name)
+    return None, 0
 
 
 def resolve_optional_path(path, repo_dir):
@@ -201,13 +249,27 @@ def resolve_optional_path(path, repo_dir):
     return repo_dir / path
 
 
+def metric_directory(path, metric):
+    base = path.parent if path.name in {"sp", "eo"} else path
+    return base / metric
+
+
+def metric_output_path(path, metric):
+    return metric_directory(path.parent, metric) / path.name
+
+
 def run_generated_pareto(args, repo_dir, controller_root):
     summary_csv = resolve_optional_path(args.pareto_summary_csv, repo_dir)
     if summary_csv is None:
         summary_csv = controller_root / f"{args.name_prefix}_summary.csv"
+    else:
+        summary_csv = metric_output_path(summary_csv, args.fair_score_metric)
     plot_path = resolve_optional_path(args.pareto_plot_path, repo_dir)
     if plot_path is None:
-        plot_path = controller_root / f"{args.name_prefix}_pareto_lp_auc_vs_score_sp.jpg"
+        metric_label = "score_sp" if args.fair_score_metric == "sp" else "eo"
+        plot_path = controller_root / f"{args.name_prefix}_pareto_lp_auc_vs_{metric_label}.jpg"
+    else:
+        plot_path = metric_output_path(plot_path, args.fair_score_metric)
 
     summarize_script = repo_dir / "scripts" / "summarize_controller_grid.py"
     plot_script = repo_dir / "scripts" / "plot_controller_grid_pareto.py"
@@ -217,6 +279,7 @@ def run_generated_pareto(args, repo_dir, controller_root):
         str(summarize_script),
         "--controller_root", str(controller_root),
         "--prefix", args.name_prefix,
+        "--fair_score_metric", args.fair_score_metric,
         "--sort_by", args.pareto_x_metric,
         "--out_csv", str(summary_csv),
     ]
@@ -224,6 +287,7 @@ def run_generated_pareto(args, repo_dir, controller_root):
         args.python_exec,
         str(plot_script),
         "--summary_csv", str(summary_csv),
+        "--fair_score_metric", args.fair_score_metric,
         "--out_path", str(plot_path),
         "--x_metric", args.pareto_x_metric,
         "--y_metric", args.pareto_y_metric,
@@ -252,11 +316,15 @@ def main():
     if not controller_root.is_absolute():
         controller_root = repo_dir / controller_root
 
+    controller_root = metric_directory(controller_root, args.fair_score_metric)
+
     manifest = args.manifest
     if manifest is None:
         manifest = controller_root / f"{args.name_prefix}_manifest.jsonl"
     if not manifest.is_absolute():
         manifest = repo_dir / manifest
+    if args.manifest is not None:
+        manifest = metric_output_path(manifest, args.fair_score_metric)
     manifest.parent.mkdir(parents=True, exist_ok=True)
 
     combos = list(itertools.product(
@@ -274,6 +342,13 @@ def main():
     print(f"[grid] controller_root={controller_root}")
     print(f"[grid] manifest={manifest}")
     print(f"[grid] num_runs={len(combos)}")
+
+    if args.include_uncontrolled:
+        baseline_summary, baseline_returncode = run_uncontrolled(args, repo_dir, controller_root)
+        if baseline_returncode:
+            raise SystemExit(baseline_returncode)
+        if baseline_summary is not None:
+            print(f"[grid] uncontrolled LP summary: {baseline_summary}")
 
     for run_idx, (fair_score_k, eta, lr, fair_w, util_w, k_w) in enumerate(combos, 1):
         run_name = make_run_name(
@@ -293,6 +368,8 @@ def main():
             "num_runs": len(combos),
             "run_name": run_name,
             "fair_score_k": fair_score_k,
+            "fair_score_metric": args.fair_score_metric,
+            "fair_score_eo_min_mass": args.fair_score_eo_min_mass,
             "eta": eta,
             "controller_lr": lr,
             "fair_weight": fair_w,
@@ -309,9 +386,17 @@ def main():
         if args.skip_existing and final_ckpt.exists():
             record["status"] = "skipped_existing"
             record["returncode"] = 0
+            if args.run_generated_eval and not args.dry_run:
+                summary_path, eval_returncode = run_generated_eval(args, repo_dir, controller_root, run_name)
+                record["generated_eval_summary"] = str(summary_path) if summary_path is not None else None
+                record["generated_eval_returncode"] = eval_returncode
+                if eval_returncode != 0:
+                    record["status"] = "generated_eval_failed"
             with manifest.open("a", encoding="utf-8") as fp:
                 fp.write(json.dumps(record) + "\n")
             print(f"[grid] skip existing: {final_ckpt}")
+            if args.fail_fast and record.get("generated_eval_returncode") not in (None, 0):
+                raise SystemExit(record["generated_eval_returncode"])
             continue
 
         if args.dry_run:

@@ -204,6 +204,8 @@ def build_parser():
     parser.add_argument('--fair_score_eta', type=float, default=None, help='deprecated compatibility value; no longer changes sampling')
     parser.add_argument('--fair_score_k', type=float, default=None, help='deprecated compatibility value; no longer changes sampling')
     parser.add_argument('--fair_score_apply_sample', type=eval, default=None, help='deprecated compatibility flag; no longer changes sampling')
+    parser.add_argument('--fair_score_metric', choices=['sp', 'eo'], default=None, help='fairness metric; defaults to the saved run metric, or sp for old runs')
+    parser.add_argument('--fair_score_eo_min_mass', type=float, default=None)
     parser.add_argument('--fair_label_attr', type=str, default=None)
     parser.add_argument('--fair_sensitive_attr', type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument('--fair_sensitive_value', type=int, default=None, help=argparse.SUPPRESS)
@@ -249,6 +251,11 @@ def run_evaluate(eval_args):
         args.fair_edge_sensitive_mode = eval_args.fair_edge_sensitive_mode
     args.fair_label_attr = resolve_fair_label_attr(eval_args, args)
     args.fair_score_sp = bool(eval_args.fair_score_sp or getattr(args, 'fair_score_sp', False))
+    args.fair_score_metric = getattr(eval_args, 'fair_score_metric', None) or getattr(args, 'fair_score_metric', 'sp')
+    if getattr(eval_args, 'fair_score_eo_min_mass', None) is not None:
+        args.fair_score_eo_min_mass = eval_args.fair_score_eo_min_mass
+    else:
+        args.fair_score_eo_min_mass = getattr(args, 'fair_score_eo_min_mass', 1e-6)
     if eval_args.fair_score_eta is not None:
         args.fair_score_eta = eval_args.fair_score_eta
     if eval_args.fair_score_k is not None:
@@ -293,6 +300,10 @@ def run_evaluate(eval_args):
     saved_deltas = []
     if eval_args.save_samples:
         save_root = Path(eval_args.save_dir) if eval_args.save_dir is not None else Path(log_dir) / 'generated_samples'
+        if (getattr(args, 'fair_score_sp', False)
+                or getattr(args, 'fair_score_controller_train', False)
+                or args.fair_score_metric == 'eo'):
+            save_root = save_root / args.fair_score_metric
         save_root.mkdir(parents=True, exist_ok=True)
 
     # Sample in micro-batches to reduce peak GPU memory.
@@ -432,7 +443,9 @@ def run_evaluate(eval_args):
             'largest_cc': bool(eval_args.largest_cc),
             'return_edge_deltas': bool(eval_args.return_edge_deltas),
             'diffusion_stage': getattr(args, 'diffusion_stage', 'stage1_base'),
-            'fairness_sampling_enabled': False,
+            'fairness_sampling_enabled': bool(getattr(model, '_fair_guidance_active', False)),
+            'fair_score_metric': args.fair_score_metric,
+            'fair_score_eo_min_mass': args.fair_score_eo_min_mass,
             'fair_score_sp': bool(getattr(args, 'fair_score_sp', False)),
             'fair_score_eta': getattr(args, 'fair_score_eta', None),
             'fair_score_k': getattr(args, 'fair_score_k', None),

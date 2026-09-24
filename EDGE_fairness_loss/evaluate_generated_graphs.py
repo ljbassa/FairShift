@@ -481,6 +481,36 @@ def samplepy_group_fairness(labels: np.ndarray, preds: np.ndarray, pair_same_mas
     return parity, equality
 
 
+def samplepy_group_fairness_details(
+    labels: np.ndarray,
+    preds: np.ndarray,
+    pair_same_mask: np.ndarray,
+) -> Dict[str, float]:
+    labels = np.asarray(labels)
+    preds = np.asarray(preds)
+    same = np.asarray(pair_same_mask, dtype=bool)
+    diff = ~same
+    positive = labels == 1
+    same_positive = same & positive
+    diff_positive = diff & positive
+    sp_signed = safe_diff(safe_group_mean(preds, same), safe_group_mean(preds, diff))
+    eo_signed = safe_diff(
+        safe_group_mean(preds, same_positive),
+        safe_group_mean(preds, diff_positive),
+    )
+    return {
+        "sp_signed": sp_signed,
+        "sp_abs": safe_abs(sp_signed),
+        "eo_signed": eo_signed,
+        "eo_abs": safe_abs(eo_signed),
+        "eo_defined": float(same_positive.any() and diff_positive.any()),
+        "eo_num_pos_same": float(same_positive.sum()),
+        "eo_num_pos_diff": float(diff_positive.sum()),
+        "eo_score_mean_same": safe_group_mean(preds, same_positive),
+        "eo_score_mean_diff": safe_group_mean(preds, diff_positive),
+    }
+
+
 @torch.no_grad()
 def samplepy_predict(A_train: torch.Tensor, Z: torch.Tensor, group_labels: torch.Tensor, A_full_dense: torch.Tensor, mask: torch.Tensor, model: SamplePyGAE) -> Tuple[float, float, float, Dict[str, np.ndarray]]:
     model.eval()
@@ -654,6 +684,10 @@ def samplepy_train_and_eval(data, group_attr: str) -> Tuple[Dict[str, float], Di
         split["test_mask"],
         best_model,
     )
+    positive = raw["labels"] == 1
+    positive_sensitive = positive & raw["sens_mask"]
+    positive_nonsensitive = positive & ~raw["sens_mask"]
+    fairness = samplepy_group_fairness_details(raw["labels"], raw["scores"], raw["sens_mask"])
 
     metrics = {
         "lp/auc": float(test_auc),
@@ -661,8 +695,18 @@ def samplepy_train_and_eval(data, group_attr: str) -> Tuple[Dict[str, float], Di
         "lp/score_sp_abs_gap": float(test_sp),
         "lp/sp_gap": float(test_sp),
         "lp/sp_abs_gap": float(test_sp),
-        "lp/eo_gap": float(test_eo),
-        "lp/eo_abs_gap": float(test_eo),
+        "lp/eo_gap": fairness["eo_signed"],
+        "lp/eo_signed_gap": fairness["eo_signed"],
+        "lp/eo_abs_gap": fairness["eo_abs"],
+        "lp/eo_defined": float(positive_sensitive.any() and positive_nonsensitive.any()),
+        "lp/eo_num_pos_sensitive": float(positive_sensitive.sum()),
+        "lp/eo_num_pos_nonsensitive": float(positive_nonsensitive.sum()),
+        "lp/eo_score_mean_sensitive": safe_group_mean(raw["scores"], positive_sensitive),
+        "lp/eo_score_mean_nonsensitive": safe_group_mean(raw["scores"], positive_nonsensitive),
+        "lp/eo_num_pos_same": fairness["eo_num_pos_same"],
+        "lp/eo_num_pos_diff": fairness["eo_num_pos_diff"],
+        "lp/eo_score_mean_same": fairness["eo_score_mean_same"],
+        "lp/eo_score_mean_diff": fairness["eo_score_mean_diff"],
         "lp/score_mean_sensitive": safe_group_mean(raw["scores"], raw["sens_mask"]),
         "lp/score_mean_nonsensitive": safe_group_mean(raw["scores"], ~raw["sens_mask"]),
         "lp/hard_rate_sensitive": float("nan"),
@@ -682,14 +726,28 @@ def samplepy_train_and_eval(data, group_attr: str) -> Tuple[Dict[str, float], Di
 
 def samplepy_aggregate_fairness(labels: np.ndarray, scores: np.ndarray, sens_mask: np.ndarray) -> Dict[str, float]:
     sp, eo = samplepy_group_fairness(labels, scores, sens_mask)
+    fairness = samplepy_group_fairness_details(labels, scores, sens_mask)
+    positive = labels == 1
+    positive_sensitive = positive & sens_mask
+    positive_nonsensitive = positive & ~sens_mask
     return {
         "auc": safe_auc(labels, scores),
         "score_sp_gap": sp,
         "score_sp_abs_gap": sp,
         "sp_gap": sp,
         "sp_abs_gap": sp,
-        "eo_gap": eo,
-        "eo_abs_gap": eo,
+        "eo_gap": fairness["eo_signed"],
+        "eo_signed_gap": fairness["eo_signed"],
+        "eo_abs_gap": fairness["eo_abs"],
+        "eo_defined": float(positive_sensitive.any() and positive_nonsensitive.any()),
+        "eo_num_pos_sensitive": float(positive_sensitive.sum()),
+        "eo_num_pos_nonsensitive": float(positive_nonsensitive.sum()),
+        "eo_score_mean_sensitive": safe_group_mean(scores, positive_sensitive),
+        "eo_score_mean_nonsensitive": safe_group_mean(scores, positive_nonsensitive),
+        "eo_num_pos_same": fairness["eo_num_pos_same"],
+        "eo_num_pos_diff": fairness["eo_num_pos_diff"],
+        "eo_score_mean_same": fairness["eo_score_mean_same"],
+        "eo_score_mean_diff": fairness["eo_score_mean_diff"],
         "score_mean_sensitive": safe_group_mean(scores, sens_mask),
         "score_mean_nonsensitive": safe_group_mean(scores, ~sens_mask),
         "hard_rate_sensitive": float("nan"),
@@ -802,7 +860,17 @@ def evaluate_graphs(
                 "lp/sp_gap",
                 "lp/sp_abs_gap",
                 "lp/eo_gap",
+                "lp/eo_signed_gap",
                 "lp/eo_abs_gap",
+                "lp/eo_defined",
+                "lp/eo_num_pos_sensitive",
+                "lp/eo_num_pos_nonsensitive",
+                "lp/eo_score_mean_sensitive",
+                "lp/eo_score_mean_nonsensitive",
+                "lp/eo_num_pos_same",
+                "lp/eo_num_pos_diff",
+                "lp/eo_score_mean_same",
+                "lp/eo_score_mean_diff",
                 "lp/score_mean_sensitive",
                 "lp/score_mean_nonsensitive",
                 "lp/hard_rate_sensitive",

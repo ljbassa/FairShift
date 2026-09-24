@@ -273,14 +273,17 @@ def build_generate_args(args, eta: float, k: float, seed: int) -> argparse.Names
         "--seed", str(seed),
         "--device", args.gen_device,
         "--fair_score_sp",
+        "--fair_score_metric", args.fair_score_metric,
+        "--fair_score_eo_min_mass", str(args.fair_score_eo_min_mass),
         "--fair_score_eta", str(eta),
         "--fair_score_k", str(k),
+        # Override saved run settings: eta=0 is the uncontrolled baseline.
+        "--fair_score_apply_sample", str(eta != 0.0),
+        "--fair_score_guidance_normalize", str(args.fair_score_guidance_normalize),
         "--fair_sensitive_attr", args.fair_sensitive_attr,
         "--fair_edge_sensitive_mode", args.fair_edge_sensitive_mode,
         "--largest_cc", str(args.largest_cc),
     ]
-    if args.fair_score_guidance_normalize:
-        argv += ["--fair_score_guidance_normalize", "True"]
     if args.fair_sensitive_value is not None:
         argv += ["--fair_sensitive_value", str(args.fair_sensitive_value)]
 
@@ -370,6 +373,8 @@ def parse_args():
     p.add_argument("--eta_values", type=float, nargs="+", default=None)
     p.add_argument("--k_values", type=float, nargs="+", default=None)
     p.add_argument("--fair_score_guidance_normalize", type=eval, default=False)
+    p.add_argument("--fair_score_metric", choices=["sp", "eo"], default="sp")
+    p.add_argument("--fair_score_eo_min_mass", type=float, default=1e-6)
     p.add_argument("--seeds", type=int, nargs="+", default=[0])
     p.add_argument("--pair_mode", action="store_true")
     p.add_argument("--include_baseline", action="store_true")
@@ -416,6 +421,10 @@ def parse_args():
     )
 
     p.add_argument("--out_dir", type=str, required=True)
+    p.add_argument("--eo_candidates", nargs="+", default=[
+        "lp/eo_abs_gap_mean", "lp/score_eo_abs_gap_mean",
+        "aggregate_lp/eo_abs_gap", "aggregate_lp/score_eo_abs_gap",
+    ])
     p.add_argument("--plot_title", type=str, default="LP Pareto: AUC vs SP")
     p.add_argument(
         "--summary_csv",
@@ -427,6 +436,8 @@ def parse_args():
         ),
     )
     args = p.parse_args()
+    if args.fair_score_metric == "eo" and args.plot_title == "LP Pareto: AUC vs SP":
+        args.plot_title = "LP Pareto: AUC vs EO"
 
     if args.summary_csv is None:
         missing = []
@@ -446,9 +457,9 @@ def parse_args():
 
 def draw_summary_pareto(per_run_rows: List[Dict[str, Any]], args, out_dir: Path) -> Path:
     agg_rows = aggregate_seed_rows(per_run_rows)
-    x_key = "selected_sp_mean"
+    x_key = f"selected_{args.fair_score_metric}_mean"
     y_key = "selected_auc_mean"
-    xerr_key = "selected_sp_std"
+    xerr_key = f"selected_{args.fair_score_metric}_std"
     yerr_key = "selected_auc_std"
 
     front_rows = pareto_front(agg_rows, x_key=x_key, y_key=y_key)
@@ -469,7 +480,7 @@ def draw_summary_pareto(per_run_rows: List[Dict[str, Any]], args, out_dir: Path)
 def main():
     args = parse_args()
     repo_dir = Path(args.repo_dir).resolve()
-    out_dir = Path(args.out_dir).resolve()
+    out_dir = Path(args.out_dir).resolve() / args.fair_score_metric
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.summary_csv is not None:
@@ -478,6 +489,10 @@ def main():
         if not all_rows:
             raise RuntimeError(f"No rows found in {summary_csv}")
         per_run_rows = select_dataset_rows(all_rows, args.dataset, summary_csv)
+        per_run_rows = [row for row in per_run_rows
+                        if row.get("fair_score_metric", "sp") == args.fair_score_metric]
+        if not per_run_rows:
+            raise RuntimeError(f"No {args.fair_score_metric} runs found in {summary_csv}")
         plot_path = draw_summary_pareto(per_run_rows, args, out_dir)
         print(f"summary csv: {summary_csv}")
         print(f"dataset    : {args.dataset} ({len(per_run_rows)} rows)")
@@ -524,11 +539,12 @@ def main():
                         auc_key, auc_val = "NA", float("nan")
 
                     try:
-                        sp_key, sp_val = pick_metric(summary_row, args.sp_candidates)
+                        sp_key, sp_val = pick_metric(summary_row, args.eo_candidates if args.fair_score_metric == "eo" else args.sp_candidates)
                     except Exception:
                         sp_key, sp_val = "NA", float("nan")
 
                     row = {
+                        "fair_score_metric": args.fair_score_metric,
                         "dataset": args.dataset,
                         "eta": eta,
                         "k": k,
@@ -537,14 +553,15 @@ def main():
                         "generated_eval_returncode": 0,
                         "selected_auc_key": auc_key,
                         "selected_auc": auc_val,
-                        "selected_sp_key": sp_key,
-                        "selected_sp": sp_val,
+                        f"selected_{args.fair_score_metric}_key": sp_key,
+                        f"selected_{args.fair_score_metric}": sp_val,
                     }
                     row.update(summary_row)
                     row["dataset"] = args.dataset
                     per_run_rows.append(row)
                 except Exception as exc:
                     per_run_rows.append({
+                        "fair_score_metric": args.fair_score_metric,
                         "dataset": args.dataset,
                         "eta": eta,
                         "k": k,
@@ -553,8 +570,8 @@ def main():
                         "generated_eval_returncode": 1,
                         "selected_auc_key": "NA",
                         "selected_auc": float("nan"),
-                        "selected_sp_key": "NA",
-                        "selected_sp": float("nan"),
+                        f"selected_{args.fair_score_metric}_key": "NA",
+                        f"selected_{args.fair_score_metric}": float("nan"),
                         "error": str(exc),
                     })
     finally:

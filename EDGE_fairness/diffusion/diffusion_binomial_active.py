@@ -6,6 +6,7 @@ from torch_scatter import scatter
 import torch_geometric as pyg
 from diffusion.diffusion_base import cosine_beta_schedule, log_1_min_a, log_add_exp, log_categorical, index_to_log_onehot, extract
 from diffusion.diffusion_binomial_vanilla import BinomialDiffusionVanilla
+from diffusion.fairness_surrogate import group_fairness_terms, normalize_fair_score_metric
 """
 Based in part on: https://github.com/lucidrains/denoising-diffusion-pytorch/blob/5989f4c77eafcdc6be0fb4739f0f277a6dd7f7d8/denoising_diffusion_pytorch/denoising_diffusion_pytorch.py#L281
 """
@@ -24,7 +25,8 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
                  fair_score_sp=False, fair_score_eta=0.0, fair_score_k=0.15,
                  fair_score_apply_sample=True, fair_label_attr="y",
                  fair_score_guidance_normalize=False,
-                 fair_sensitive_value=None, fair_edge_sensitive_mode="either"
+                 fair_sensitive_value=None, fair_edge_sensitive_mode="either",
+                 fair_score_metric="sp", fair_score_eo_min_mass=1e-6,
                  ):
         super(BinomialDiffusionActive, self).__init__(num_node_classes, num_edge_classes, initial_graph_sampler, denoise_fn, timesteps,
                  loss_type, parametrization, final_prob_node, final_prob_edge, sample_time_method, noise_schedule, device)
@@ -38,6 +40,10 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
 
         # fairness
         self.fair_score_sp = fair_score_sp
+        self.fair_score_metric = normalize_fair_score_metric(fair_score_metric)
+        self.fair_score_eo_min_mass = float(fair_score_eo_min_mass)
+        if self.fair_score_eo_min_mass < 0:
+            raise ValueError("fair_score_eo_min_mass must be non-negative")
         self.fair_score_eta = fair_score_eta
         self.fair_score_k = fair_score_k
         self.fair_score_apply_sample = fair_score_apply_sample
@@ -106,6 +112,44 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         # 5) R1, R0 (sums per graph)
         self._fair_score_R1 = scatter(self._fair_score_q * self._fair_edge_sensitive_mask.float(), self._fair_edge_batch, dim=0, dim_size=B, reduce='sum')
         self._fair_score_R0 = scatter(self._fair_score_q * (~self._fair_edge_sensitive_mask).float(), self._fair_edge_batch, dim=0, dim_size=B, reduce='sum')
+        if self.fair_score_metric == "eo":
+            # Unguided running probabilities condition EO on soft positive edges.
+            self._fair_condition_h = self._fair_score_h.detach().clone()
+            self._fair_condition_w = self._fair_score_q.detach().clone()
+            self._fair_condition_C1 = self._fair_score_R1.detach().clone()
+            self._fair_condition_C0 = self._fair_score_R0.detach().clone()
+            self._fair_score_U1 = scatter(rho_e.square() * mask.float(), self._fair_edge_batch, dim=0, dim_size=B, reduce='sum')
+            self._fair_score_U0 = scatter(rho_e.square() * (~mask).float(), self._fair_edge_batch, dim=0, dim_size=B, reduce='sum')
+
+    def _eo_candidate_terms(self, idx_active, z_raw, q_cand):
+        batch_active = self._fair_edge_batch[idx_active]
+        condition_h = self._fair_condition_h[idx_active]
+        w_prev = self._fair_condition_w[idx_active]
+        q_prev = self._fair_score_q[idx_active]
+        condition_h_new = condition_h + self.fair_score_k * (z_raw.detach() - condition_h)
+        self._fair_condition_h[idx_active] = condition_h_new.detach()
+        w_new = torch.sigmoid(condition_h_new).detach()
+        self._fair_condition_w[idx_active] = w_new
+        same = self._fair_edge_sensitive_mask[idx_active]
+        num_graphs = self._fair_N1.numel()
+
+        def group_sum(values, mask):
+            return scatter(values * mask.float(), batch_active,
+                           dim=0, dim_size=num_graphs, reduce='sum')
+
+        self._fair_condition_C1 += group_sum(w_new - w_prev, same)
+        self._fair_condition_C0 += group_sum(w_new - w_prev, ~same)
+        self._fair_score_U1 += group_sum(w_new * q_cand - w_prev * q_prev, same)
+        self._fair_score_U0 += group_sum(w_new * q_cand - w_prev * q_prev, ~same)
+        return group_fairness_terms(
+            "eo", self._fair_score_R1, self._fair_score_R0,
+            self._fair_condition_C1, self._fair_condition_C0,
+            self._fair_score_U1, self._fair_score_U0,
+            self._fair_N1, self._fair_N0,
+            q_active=q_cand, positive_weight_active=w_new,
+            batch_active=batch_active, same_active=same,
+            min_positive_mass=self.fair_score_eo_min_mass,
+        )
 
     # 모델 기반 active 선택 함수
     def _p_sample_and_set_actives_model(self, batched_graph, t_node, t_edge):
@@ -301,6 +345,11 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             
             # sample-time step scale: s_b = (N1 + N0) / 2  (full-edge 기준)
             step_scale_graph = 0.5 * (self._fair_N1 + self._fair_N0)
+            if self.fair_score_metric == "eo":
+                eo_terms = self._eo_candidate_terms(idx_active, z_raw, q_cand)
+                delta_sp = eo_terms["gap"]
+                a_e = eo_terms["derivative"]
+                step_scale_graph = 0.5 * (eo_terms["support_same"] + eo_terms["support_diff"])
             step_scale_active = step_scale_graph[batch_active]
 
             # scaled coefficient
@@ -346,6 +395,8 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             
             # No-op for graphs with N1=0 or N0=0
             valid_guidance = (self._fair_N1 > 0) & (self._fair_N0 > 0)
+            if self.fair_score_metric == "eo":
+                valid_guidance = eo_terms["valid_graph"]
             z_final = torch.where(valid_guidance[batch_active], z_guided, z_raw)
             
             # Rebuild log_model_prob_edge
@@ -364,11 +415,15 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
             dr0 = scatter(delta_q_new * (~mask_active).float(), batch_active, dim=0, dim_size=batched_graph.num_graphs, reduce='sum')
             self._fair_score_R1 += dr1
             self._fair_score_R0 += dr0
+            if self.fair_score_metric == "eo":
+                delta_u = self._fair_condition_w[idx_active] * (q_new - q_cand)
+                self._fair_score_U1 += scatter(delta_u * mask_active.float(), batch_active, dim=0, dim_size=batched_graph.num_graphs, reduce='sum')
+                self._fair_score_U0 += scatter(delta_u * (~mask_active).float(), batch_active, dim=0, dim_size=batched_graph.num_graphs, reduce='sum')
             
             # Fill fair_trace
-            fair_trace["fair_score_sp_enabled"] = True
+            fair_trace[f"fair_score_{self.fair_score_metric}_enabled"] = True
             fair_trace["fair_score_k"] = self.fair_score_k
-            fair_trace["fair_score_delta_sp"] = delta_sp.detach()
+            fair_trace[f"fair_score_delta_{self.fair_score_metric}"] = delta_sp.detach()
             fair_trace["fair_score_C1"] = c1.detach()
             fair_trace["fair_score_C0"] = c0.detach()
             fair_trace["fair_score_mean_q_active_prev"] = q_prev.mean().item()
@@ -748,6 +803,8 @@ class BinomialDiffusionActive(BinomialDiffusionVanilla):
         if return_soft and self.fair_score_sp and hasattr(self, "_fair_score_q") and hasattr(self, "_fair_score_h"):
             batched_graph.full_edge_score_prob = self._fair_score_q.detach().clone()
             batched_graph.full_edge_score_logit = self._fair_score_h.detach().clone()
+            if self.fair_score_metric == "eo":
+                batched_graph.full_edge_positive_weight = self._fair_condition_w.detach().clone()
 
         # 아래는 원래 DiffusionBase.sample() 후처리 그대로 (edge_index 생성 등)
         edge_attr = batched_graph.log_full_edge_attr_t.argmax(-1)

@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import pickle
+import sys
 import time
 
 import numpy as np
@@ -20,10 +21,23 @@ torch.set_num_threads(4)
 
 # Data
 add_parent_path(level=1)
-from datasets.data import add_data_args, get_data, get_data_id
 
-# Exp args only; do not use GraphExperiment/elbo_bpd here.
-from experiment import add_exp_args
+
+# Keep the legacy names patchable while avoiding evaluator/TensorBoard imports
+# in the pilot process before physical cuda:4 has been selected.
+def add_data_args(parser):
+    from datasets.data import add_data_args as legacy_add_data_args
+    return legacy_add_data_args(parser)
+
+
+def get_data(args):
+    from datasets.data import get_data as legacy_get_data
+    return legacy_get_data(args)
+
+
+def get_data_id(args):
+    from datasets.data import get_data_id as legacy_get_data_id
+    return legacy_get_data_id(args)
 
 # Model
 from model import add_model_args, get_model, get_model_id
@@ -33,10 +47,13 @@ from diffusion.optim.multistep import add_optim_args
 
 
 def prepare_args(args):
-    args.fair_score_sp = True
-    args.fair_score_learn_k = True
-    args.fair_score_learn_eta = True
-    args.fair_score_controller_train = True
+    controlled = not getattr(args, "uncontrolled", False)
+    args.fair_score_sp = controlled
+    args.fair_score_eta_mode = getattr(args, 'fair_score_eta_mode', 'per_step')
+    args.fair_score_k_mode = getattr(args, 'fair_score_k_mode', 'per_step')
+    args.fair_score_learn_k = controlled and args.fair_score_k_mode != 'fixed_one'
+    args.fair_score_learn_eta = controlled
+    args.fair_score_controller_train = controlled
 
     if args.controller_pretrained_ckpt is None:
         raise ValueError("--controller_pretrained_ckpt is required for controller training")
@@ -50,6 +67,8 @@ def prepare_args(args):
         args.name = time.strftime("%Y-%m-%d_%H-%M-%S")
     args.controller_replay_refresh = max(1, int(args.controller_replay_refresh))
     args.controller_replay_num_samples = max(1, int(args.controller_replay_num_samples))
+    if args.fair_score_metric == "eo" and args.fair_score_eo_min_mass < 0:
+        raise ValueError("--fair_score_eo_min_mass must be non-negative")
     return args
 
 
@@ -112,7 +131,7 @@ def load_pretrained_model(model, ckpt_path, device):
     state_dict.pop("module.fair_score_eta_raw", None)
     print(
         "[controller] Ignoring fair_score_k_raw/fair_score_eta_raw from pretrained denoiser checkpoint; "
-        "initializing per-step controller parameters from CLI values."
+        "initializing the selected controller modes from CLI values."
     )
     if any(k.startswith("module.") for k in state_dict.keys()):
         state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
@@ -128,7 +147,11 @@ def load_pretrained_model(model, ckpt_path, device):
 
 def make_log_dir(args, data_id, model_id):
     log_base = args.log_home if args.log_home is not None else "./wandb"
-    log_dir = os.path.join(log_base, data_id, model_id, "controller", args.name)
+    controller_root = getattr(args, "controller_root", None) or os.path.join(log_base, data_id, model_id, "controller")
+    controller_root = os.path.normpath(controller_root)
+    if os.path.basename(controller_root) in {"sp", "eo"}:
+        controller_root = os.path.dirname(controller_root)
+    log_dir = os.path.join(controller_root, args.fair_score_metric, args.name)
     check_dir = os.path.join(log_dir, "check")
     os.makedirs(check_dir, exist_ok=True)
     with open(os.path.join(log_dir, "args.pickle"), "wb") as f:
@@ -187,6 +210,7 @@ def evaluate_controller(args, model, evaluator):
 
     generated_graphs = []
     fair_shift_values = []
+    guidance_diagnostics = []
     done = 0
     was_training = model.training
     model.eval()
@@ -197,6 +221,8 @@ def evaluate_controller(args, model, evaluator):
         generated = model.sample(cur_batch, controller_replay=replay)
         if hasattr(model, "_last_fair_guidance_mean_abs_shift"):
             fair_shift_values.append(float(model._last_fair_guidance_mean_abs_shift))
+        if hasattr(model, "_last_fair_guidance_diagnostics"):
+            guidance_diagnostics.append(dict(model._last_fair_guidance_diagnostics))
         if getattr(args, "cpu_offload_generated", True):
             generated = generated.cpu()
         for pyg_data in generated.to_data_list():
@@ -211,6 +237,13 @@ def evaluate_controller(args, model, evaluator):
     metrics = evaluator.evaluate(generated_graphs)
     if fair_shift_values:
         metrics["fair_guidance_mean_abs_shift"] = float(np.mean(fair_shift_values))
+    if guidance_diagnostics:
+        for key, value in guidance_diagnostics[0].items():
+            if isinstance(value, (int, float)):
+                values = np.asarray([item[key] for item in guidance_diagnostics], dtype=float)
+                values = values[np.isfinite(values)]
+                if values.size:
+                    metrics[f"fair_guidance_{key}"] = float(values.mean())
     return metrics
 
 
@@ -227,8 +260,12 @@ def controller_grad_diagnostics(model):
             float(grad_abs.max().cpu()),
         )
 
-    k_nonzero, k_mean_abs, k_max_abs = _summarize_grad(model.fair_score_k_raw.grad)
-    eta_nonzero, eta_mean_abs, eta_max_abs = _summarize_grad(model.fair_score_eta_raw.grad)
+    k_nonzero, k_mean_abs, k_max_abs = _summarize_grad(
+        model.fair_score_k_raw.grad if model.fair_score_k_raw is not None else None
+    )
+    eta_nonzero, eta_mean_abs, eta_max_abs = _summarize_grad(
+        model.fair_score_eta_raw.grad if model.fair_score_eta_raw is not None else None
+    )
     return {
         "grad/k_nonzero": k_nonzero,
         "grad/eta_nonzero": eta_nonzero,
@@ -241,8 +278,9 @@ def controller_grad_diagnostics(model):
 
 @torch.no_grad()
 def debug_controller_shapes(args, model):
-    print(f"[controller debug] fair_score_k_raw.shape: {model.fair_score_k_raw.shape}")
-    print(f"[controller debug] fair_score_eta_raw.shape: {model.fair_score_eta_raw.shape}")
+    for name in ('fair_score_k_raw', 'fair_score_eta_raw'):
+        value = getattr(model, name)
+        print(f"[controller debug] {name}.shape: {value.shape if value is not None else 'None (fixed)'}")
     print(f"[controller debug] effective k shape: {model._get_effective_fair_score_k().shape}")
     print(f"[controller debug] effective eta shape: {model._get_effective_fair_score_eta().shape}")
 
@@ -254,8 +292,10 @@ def debug_controller_shapes(args, model):
     print(f"[controller debug] effective k[t_graph]: {model._get_effective_fair_score_k(t_graph=t_graph)}")
     print(f"[controller debug] effective eta[t_graph]: {model._get_effective_fair_score_eta(t_graph=t_graph)}")
     print(
-        "[controller debug] expected raw/effective full shapes: "
-        f"[{args.diffusion_steps}], indexed shape: [3]"
+        "[controller debug] expected effective full shape: "
+        f"[{args.diffusion_steps}], indexed shape: [3]; "
+        f"raw eta parameters: {1 if args.fair_score_eta_mode == 'shared' else args.diffusion_steps}, "
+        f"raw k parameters: {0 if args.fair_score_k_mode == 'fixed_one' else args.diffusion_steps}"
     )
 
 
@@ -300,6 +340,10 @@ def save_generated_graphs_for_lp(args, model, log_dir, tag, epoch, checkpoint_pa
     num_samples = int(args.num_generation)
     graph_path = os.path.join(generated_dir, f"{tag}.pyg_full.pt")
     meta_path = os.path.join(generated_dir, f"{tag}.meta.json")
+    generation_seed = getattr(args, "generation_seed", None)
+    if generation_seed is not None:
+        set_seeds(generation_seed)
+        print(f"[controller] Final generated-graph export seed: {generation_seed}")
     generated_graphs = sample_controller_pyg_graphs(args, model, total=num_samples)
     torch.save(generated_graphs, graph_path)
 
@@ -314,6 +358,14 @@ def save_generated_graphs_for_lp(args, model, log_dir, tag, epoch, checkpoint_pa
     )
     meta = {
         "tag": tag,
+        "fair_score_metric": args.fair_score_metric,
+        "fair_score_eo_min_mass": args.fair_score_eo_min_mass,
+        "fair_score_eta_mode": getattr(args, "fair_score_eta_mode", "per_step"),
+        "fair_score_k_mode": getattr(args, "fair_score_k_mode", "per_step"),
+        "training_seed": getattr(args, "seed", None),
+        "generation_seed": generation_seed,
+        "uncontrolled": bool(getattr(args, "uncontrolled", False)),
+        "fairness_sampling_enabled": bool(model.fair_score_controller_train),
         "epoch": int(epoch) if epoch is not None else None,
         "num_graphs": len(generated_graphs),
         "graph_path": graph_path,
@@ -328,18 +380,64 @@ def save_generated_graphs_for_lp(args, model, log_dir, tag, epoch, checkpoint_pa
     return graph_path
 
 
-def main():
+def build_parser(*, prespecified_pilot=False):
     parser = argparse.ArgumentParser()
-    add_data_args(parser)
-    add_exp_args(parser)
-    add_model_args(parser)
-    add_optim_args(parser)
-    parser.add_argument(
-        "--controller_debug_shapes",
-        action="store_true",
-        help="print per-step controller parameter/getter shape checks before training",
-    )
-    args = prepare_args(parser.parse_args())
+    if prespecified_pilot:
+        from proxy_minimal_pilot import PILOT_CONTROLLER_CONFIG
+        parser.add_argument("--device", default="cuda:4")
+        parser.add_argument("--seed", type=int, default=None)
+        parser.add_argument("--name", default=None)
+        parser.add_argument("--fair_score_metric", choices=("sp", "eo"), default="sp")
+        parser.add_argument("--controller_pretrained_ckpt", default=None)
+        for key, value in PILOT_CONTROLLER_CONFIG.items():
+            if isinstance(value, bool):
+                parser.add_argument(f"--{key}", choices=("True", "False"), default=str(value))
+            else:
+                parser.add_argument(f"--{key}", type=type(value), default=value)
+    else:
+        # Preserve the public full parser and its controller ablation options.
+        from experiment import add_exp_args
+        add_data_args(parser)
+        add_exp_args(parser)
+        add_model_args(parser)
+        add_optim_args(parser)
+    parser.add_argument("--controller_root", default=None, help="controller output base; runs are saved under {sp,eo}/name")
+    parser.add_argument("--prespecified_pilot", action="store_true",
+                        help="opt-in fixed Cora pilot: frozen saved backbone, final controller only, no eval/export/grid")
+    parser.add_argument("--pilot_backbone_args", default=None, help="read saved actual backbone args.pickle in place")
+    parser.add_argument("--pilot_graph", default=None, help="read original Cora feature graph in place; no reference evaluator")
+    parser.add_argument("--pilot_audit_path", default=None, help="default: pilot run directory/pilot_training_audit.json")
+    if not prespecified_pilot:
+        parser.add_argument(
+            "--uncontrolled",
+            action="store_true",
+            help="export the frozen Stage-1 baseline with controller guidance disabled; do not train a controller",
+        )
+        parser.add_argument(
+            "--generation_seed",
+            type=int,
+            default=None,
+            help="reset RNGs before final generated-graph export; defaults to the current RNG state",
+        )
+        parser.add_argument(
+            "--controller_debug_shapes",
+            action="store_true",
+            help="print controller parameter/getter shape checks before training",
+        )
+    return parser
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser(prespecified_pilot="--prespecified_pilot" in argv)
+    cli_args = parser.parse_args(argv)
+    if cli_args.prespecified_pilot:
+        from proxy_minimal_pilot import prepare_pilot_args, run_pilot_training
+        cli_args.fair_score_guidance_normalize = cli_args.fair_score_guidance_normalize == "True"
+        supplied = {item[2:].split("=", 1)[0] for item in argv if item.startswith("--")}
+        args = prepare_pilot_args(cli_args, supplied_options=supplied)
+        return run_pilot_training(args)
+    args = prepare_args(cli_args)
     set_seeds(args.seed)
 
     if args.parallel == "dp":
@@ -362,10 +460,28 @@ def main():
     model = model.to(args.device)
 
     load_pretrained_model(model, args.controller_pretrained_ckpt, args.device)
+    if args.uncontrolled:
+        if model.fair_score_controller_train:
+            raise RuntimeError("Uncontrolled baseline requires controller guidance to be disabled")
+        log_dir, _ = make_log_dir(args, data_id, model_id)
+        print(f"[controller] Exporting uncontrolled Stage-1 baseline: {log_dir}")
+        save_generated_graphs_for_lp(
+            args=args,
+            model=model,
+            log_dir=log_dir,
+            tag="controller_best",
+            epoch=None,
+            checkpoint_path=args.controller_pretrained_ckpt,
+        )
+        return
     if args.controller_debug_shapes:
         debug_controller_shapes(args, model)
     controller_params = model.freeze_for_fair_controller_training()
     optimizer = torch.optim.Adam(controller_params, lr=args.controller_lr)
+    print(
+        f"[controller] eta mode: {model.fair_score_eta_mode}; k mode: {model.fair_score_k_mode}; "
+        f"trainable controller parameters: {sum(p.numel() for p in controller_params)}"
+    )
 
     log_dir, check_dir = make_log_dir(args, data_id, model_id)
     metrics_path = os.path.join(log_dir, "controller_metrics.jsonl")
@@ -393,8 +509,12 @@ def main():
         loss.backward()
 
         if __debug__:
-            assert model.fair_score_k_raw.numel() == args.diffusion_steps
-            assert model.fair_score_eta_raw.numel() == args.diffusion_steps
+            if args.fair_score_k_mode == 'fixed_one':
+                assert model.fair_score_k_raw is None
+            else:
+                assert model.fair_score_k_raw.numel() == args.diffusion_steps
+            expected_eta_params = 1 if args.fair_score_eta_mode == 'shared' else args.diffusion_steps
+            assert model.fair_score_eta_raw.numel() == expected_eta_params
 
         grad_stats = controller_grad_diagnostics(model)
         stats.update(grad_stats)

@@ -199,20 +199,20 @@ python fair_grid_eval_generated_graphs.py \
 Expected outputs:
 
 ```text
-fair_grid_generated_lp_norm_cora/summary_long.csv
-fair_grid_generated_lp_norm_cora/summary_long_cora.csv
-fair_grid_generated_lp_norm_cora/pareto_curve_cora.jpg
+fair_grid_generated_lp_norm_cora/sp/summary_long.csv
+fair_grid_generated_lp_norm_cora/sp/summary_long_cora.csv
+fair_grid_generated_lp_norm_cora/sp/pareto_curve_cora.jpg
 ```
 
 The CSV files used for the LP AUC vs score-SP table are produced by the command above. The per-run CSV files are under
-`fair_grid_generated_lp_norm_cora/evaluated_graphs/`, and the aggregate CSVs are the top-level `summary_long*.csv`
-files.
+`fair_grid_generated_lp_norm_cora/sp/evaluated_graphs/`, and the aggregate CSVs are the `summary_long*.csv`
+files in the `sp/` directory.
 
 To keep a short generic filename as well:
 
 ```bash
-cp fair_grid_generated_lp_norm_cora/summary_long_cora.csv \
-  fair_grid_generated_lp_norm_cora/summary.csv
+cp fair_grid_generated_lp_norm_cora/sp/summary_long_cora.csv \
+  fair_grid_generated_lp_norm_cora/sp/summary.csv
 ```
 
 You can redraw only the Pareto curve from an existing summary CSV without regenerating graphs:
@@ -221,7 +221,7 @@ You can redraw only the Pareto curve from an existing summary CSV without regene
 python fair_grid_eval_generated_graphs.py \
   --repo_dir . \
   --dataset cora \
-  --summary_csv fair_grid_generated_lp_norm_cora/summary_long_cora.csv \
+  --summary_csv fair_grid_generated_lp_norm_cora/sp/summary_long_cora.csv \
   --auc_candidates lp/auc_mean aggregate_lp/auc \
   --sp_candidates lp/score_sp_abs_gap_mean aggregate_lp/score_sp_abs_gap \
   --out_dir fair_grid_generated_lp_norm_cora
@@ -233,4 +233,103 @@ Training outputs are stored under:
 
 ```text
 wandb/<dataset>/multinomial_diffusion/multistep/<run_name>/
+```
+
+## Equal opportunity (EO) guidance
+
+This folder implements fixed sampling-time guidance (EDGE-cond FairShift-F). SP remains the default.
+`evaluate.py`, `fair_grid_eval.py`, and `fair_grid_eval_generated_graphs.py` accept
+`--fair_score_metric sp` or `--fair_score_metric eo`. For direct generation with `evaluate.py`, enable the
+existing guidance switch `--fair_score_sp` together with `--fair_score_metric eo`; the switch name is retained
+for compatibility with older run arguments.
+
+The differentiable EO surrogate compares edges joining nodes with the same label against edges joining nodes
+with different labels. For either group, its conditional score is `sum(w * q) / sum(w)`, where `q` is the guided
+running edge probability and `w` is the detached running probability from the unguided denoiser logits.
+The guidance uses the signed difference between the two conditional scores. This soft-positive condition is
+separate from the held-out link-prediction EO metric reported by `evaluate_generated_graphs.py`.
+
+`--fair_score_eo_min_mass` defaults to `1e-6`. A graph receives no EO correction when either group is empty or
+either group's positive mass is at or below that threshold. No pseudo-count is added to make an unsupported
+group appear valid. `--fair_score_guidance_normalize True` normalizes the guidance gradient, while
+`--fair_score_eta` and `--fair_score_k` control guidance strength and the running-logit update.
+
+### EO grid and uncontrolled baseline
+
+Run from this folder after creating `graphs/cora_feat.pkl` and preparing a stage-1 EDGE run. Set
+`EDGE_STAGE1_DIR` to the directory containing `args.pickle` and `check/`; it may be outside this checkout.
+The example below requires `check/checkpoint_9999.pt` because `--checkpoint 10000` uses a zero-indexed filename.
+Choose an allowed CPU core for `EDGE_CPU` and use the Python environment with the dependencies above installed.
+
+```bash
+export EDGE_STAGE1_DIR=/absolute/path/to/edge_stage1_run
+export EDGE_CPU=2
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1 TF_NUM_INTRAOP_THREADS=1 TF_NUM_INTEROP_THREADS=1
+
+taskset -c "$EDGE_CPU" python fair_grid_eval_generated_graphs.py \
+  --repo_dir . \
+  --dataset cora \
+  --run_dir "$EDGE_STAGE1_DIR" \
+  --checkpoint 10000 \
+  --fair_score_metric eo \
+  --fair_score_eo_min_mass 1e-6 \
+  --fair_score_guidance_normalize True \
+  --eta_values 0.0005 0.001 0.0025 0.005 0.01 0.02 \
+  --k_values 0.1 0.3 0.5 0.7 \
+  --include_baseline --baseline_k 1 \
+  --num_samples 8 --seeds 0 1 2 \
+  --gen_device cuda:0 --lp_device cuda:0 \
+  --fair_sensitive_attr y --largest_cc False --graph_variant full \
+  --lp_model gcn --lp_epochs 200 \
+  --auc_candidates lp/auc_mean --eo_candidates lp/eo_abs_gap_mean \
+  --out_dir results/fixed_eo_grid/cora
+```
+
+This evaluates 24 guided settings plus one uncontrolled setting for each seed. At `eta=0`, the grid explicitly
+sets `fair_score_apply_sample=False`; nonzero settings explicitly enable it. The grid also overrides saved
+normalization settings, so an older checkpoint's arguments do not silently change the requested experiment.
+
+Both grid drivers separate outputs into `<out_dir>/sp/` and `<out_dir>/eo/`. For this example, the EO summary is
+`results/fixed_eo_grid/cora/eo/summary_long_cora.csv` and the plot is
+`results/fixed_eo_grid/cora/eo/pareto_curve_cora.jpg`. The grid passes generated graphs to the evaluator in memory.
+Direct generation with sample saving enabled writes to `<save_dir or run_dir/generated_samples>/<sp|eo>/`.
+Generated data, checkpoints, CSVs, figures, and logs are excluded from this aggregate repository.
+
+### Select EO operating points
+
+The selector compares matched seed sets and graph counts against the uncontrolled `(eta=0, k=1)` baseline.
+It rejects failed, incomplete, non-finite, or explicitly undefined EO measurements. `auc_retained` selects the
+lowest EO gap among improvements with at most `--auc_max_drop` loss in AUC; `fairness_oriented` selects the lowest
+EO gap among improvements without that AUC constraint. If no run qualifies, the corresponding row records
+`no_qualifying_run`. Means and population standard deviations summarize per-seed graph means.
+
+```bash
+taskset -c "$EDGE_CPU" python scripts/select_fixed_eo_operating_points.py \
+  --dataset cora \
+  --summary_csv results/fixed_eo_grid/cora/eo/summary_long_cora.csv \
+  --auc_max_drop 0.01 \
+  --out_csv results/fixed_eo_grid/cora/eo/operating_points_cora.csv
+```
+
+`scripts/run_fixed_eo_grid.sh` combines the same grid and selector for Cora or Citeseer. It uses `python` from
+the active environment by default; set `EDGE_PYTHON` to override it. Set `EDGE_RUN_DIR` to the prepared stage-1
+directory and `EDGE_CHECKPOINT` to the checkpoint argument (default `10000`). `EDGE_OUT_DIR` overrides the result
+directory, and `EDGE_CPU_THREADS` defaults to `1`. The GPU argument selects the physical device, exposed as
+`cuda:0` inside the process. The dry run validates input paths and grid settings without sampling or LP training.
+
+```bash
+export EDGE_RUN_DIR="$EDGE_STAGE1_DIR"
+export EDGE_CHECKPOINT=10000
+taskset -c "$EDGE_CPU" bash scripts/run_fixed_eo_grid.sh cora 0 --dry_run
+# Remove --dry_run to generate graphs, evaluate them, and select operating points.
+```
+
+### EO regression checks
+
+The tests cover the weighted surrogate and its derivative, invalid-group behavior, SP compatibility,
+checkpoint argument overrides, and operating-point selection. They do not run full graph generation or training.
+
+```bash
+taskset -c "$EDGE_CPU" python -m unittest discover -s tests -v
 ```
